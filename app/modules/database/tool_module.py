@@ -864,4 +864,721 @@ class Tool(Base):
 
             session.delete(tool)
             session.commit()
-            info_id(f
+            info_id(f"Deleted tool: {tool_name} (ID: {tool_id})", rid)
+            return True
+
+        except Exception as e:
+            session.rollback()
+            error_id(f"Error deleting tool: {e}", rid, exc_info=True)
+            return False
+
+    @classmethod
+    @with_request_id
+    def get_tools_by_category(cls, session, category_id, include_subcategories=False, request_id=None):
+        """Get all tools in a specific category."""
+        rid = request_id or get_request_id()
+
+        try:
+            if include_subcategories:
+                # Get category and all subcategories
+                category_ids = cls._get_category_hierarchy_ids(session, category_id)
+                tools = session.query(cls).filter(cls.tool_category_id.in_(category_ids)).all()
+            else:
+                tools = session.query(cls).filter(cls.tool_category_id == category_id).all()
+
+            debug_id(f"Found {len(tools)} tools in category {category_id}", rid)
+            return tools
+
+        except Exception as e:
+            error_id(f"Error getting tools by category: {e}", rid, exc_info=True)
+            return []
+
+    @classmethod
+    def _get_category_hierarchy_ids(cls, session, category_id):
+        """Recursively get category ID and all subcategory IDs."""
+        ids = [category_id]
+        subcategories = session.query(ToolCategory).filter(ToolCategory.parent_id == category_id).all()
+        for sub in subcategories:
+            ids.extend(cls._get_category_hierarchy_ids(session, sub.id))
+        return ids
+
+    @classmethod
+    @with_request_id
+    def get_tools_by_manufacturer(cls, session, manufacturer_id, request_id=None):
+        """Get all tools from a specific manufacturer."""
+        rid = request_id or get_request_id()
+
+        try:
+            tools = session.query(cls).filter(cls.tool_manufacturer_id == manufacturer_id).all()
+            debug_id(f"Found {len(tools)} tools from manufacturer {manufacturer_id}", rid)
+            return tools
+
+        except Exception as e:
+            error_id(f"Error getting tools by manufacturer: {e}", rid, exc_info=True)
+            return []
+
+
+# ===========================================
+# TOOL MANAGER CLASS (Business Logic)
+# ===========================================
+
+class ToolManager:
+    """
+    Comprehensive tool management class providing search, add, and delete operations.
+    Integrates with existing database configuration and logging system.
+    """
+
+    def __init__(self, db_config: DatabaseConfig = None):
+        """
+        Initialize the ToolManager with database configuration.
+
+        Args:
+            db_config: DatabaseConfig instance for database operations
+        """
+        self.db_config = db_config or DatabaseConfig()
+        self.request_id = get_request_id()
+        logger.info(f"ToolManager initialized with request ID: {self.request_id}")
+
+    # ===================
+    # SEARCH OPERATIONS
+    # ===================
+
+    @with_request_id
+    def search_tools(self,
+                     name: Optional[str] = None,
+                     category_id: Optional[int] = None,
+                     category_name: Optional[str] = None,
+                     manufacturer_id: Optional[int] = None,
+                     manufacturer_name: Optional[str] = None,
+                     tool_type: Optional[str] = None,
+                     material: Optional[str] = None,
+                     size: Optional[str] = None,
+                     description_contains: Optional[str] = None,
+                     include_relationships: bool = True,
+                     limit: Optional[int] = None,
+                     offset: Optional[int] = 0,
+                     request_id: Optional[str] = None) -> List[Tool]:
+        """
+        Search for tools with various filter criteria.
+
+        Args:
+            name: Partial or exact tool name match
+            category_id: Filter by specific category ID
+            category_name: Filter by category name (partial match)
+            manufacturer_id: Filter by specific manufacturer ID
+            manufacturer_name: Filter by manufacturer name (partial match)
+            tool_type: Filter by tool type
+            material: Filter by material
+            size: Filter by size
+            description_contains: Search in description text
+            include_relationships: Whether to eagerly load related data
+            limit: Maximum number of results to return
+            offset: Number of results to skip (for pagination)
+            request_id: Optional request ID for logging
+
+        Returns:
+            List of Tool objects matching the criteria
+        """
+        rid = request_id or get_request_id()
+
+        try:
+            with self.db_config.main_session() as session:
+                # Start with base query
+                query = session.query(Tool)
+
+                # Add eager loading for relationships if requested
+                if include_relationships:
+                    query = query.options(
+                        joinedload(Tool.tool_category),
+                        joinedload(Tool.tool_manufacturer),
+                        selectinload(Tool.tool_packages),
+                        selectinload(Tool.tool_image_association),
+                        selectinload(Tool.tool_position_association)
+                    )
+
+                # Build filter conditions
+                conditions = []
+
+                # Name filter (case-insensitive partial match)
+                if name:
+                    conditions.append(Tool.name.ilike(f'%{name}%'))
+
+                # Category filters
+                if category_id:
+                    conditions.append(Tool.tool_category_id == category_id)
+                elif category_name:
+                    query = query.join(ToolCategory)
+                    conditions.append(ToolCategory.name.ilike(f'%{category_name}%'))
+
+                # Manufacturer filters
+                if manufacturer_id:
+                    conditions.append(Tool.tool_manufacturer_id == manufacturer_id)
+                elif manufacturer_name:
+                    query = query.join(ToolManufacturer)
+                    conditions.append(ToolManufacturer.name.ilike(f'%{manufacturer_name}%'))
+
+                # Type filter
+                if tool_type:
+                    conditions.append(Tool.type.ilike(f'%{tool_type}%'))
+
+                # Material filter
+                if material:
+                    conditions.append(Tool.material.ilike(f'%{material}%'))
+
+                # Size filter
+                if size:
+                    conditions.append(Tool.size.ilike(f'%{size}%'))
+
+                # Description filter
+                if description_contains:
+                    conditions.append(Tool.description.ilike(f'%{description_contains}%'))
+
+                # Apply all conditions
+                if conditions:
+                    query = query.filter(and_(*conditions))
+
+                # Apply pagination
+                if offset:
+                    query = query.offset(offset)
+                if limit:
+                    query = query.limit(limit)
+
+                # Execute query
+                tools = query.all()
+
+                info_id(f"Search found {len(tools)} tools matching criteria", rid)
+                return tools
+
+        except SQLAlchemyError as e:
+            error_id(f"Database error during tool search: {e}", rid, exc_info=True)
+            raise
+        except Exception as e:
+            error_id(f"Unexpected error during tool search: {e}", rid, exc_info=True)
+            raise
+
+    @with_request_id
+    def get_tool_by_id(self, tool_id: int, include_relationships: bool = True, request_id: Optional[str] = None) -> \
+    Optional[Tool]:
+        """
+        Get a specific tool by its ID.
+
+        Args:
+            tool_id: The ID of the tool to retrieve
+            include_relationships: Whether to eagerly load related data
+            request_id: Optional request ID for logging
+
+        Returns:
+            Tool object if found, None otherwise
+        """
+        rid = request_id or get_request_id()
+
+        try:
+            with self.db_config.main_session() as session:
+                return Tool.get_tool_by_id(session, tool_id, include_relationships, request_id=rid)
+
+        except SQLAlchemyError as e:
+            error_id(f"Database error getting tool by ID {tool_id}: {e}", rid, exc_info=True)
+            raise
+        except Exception as e:
+            error_id(f"Unexpected error getting tool by ID {tool_id}: {e}", rid, exc_info=True)
+            raise
+
+    @with_request_id
+    def search_tools_full_text(self, search_term: str, limit: Optional[int] = 50, request_id: Optional[str] = None) -> \
+    List[Tool]:
+        """
+        Perform full-text search across tool name, type, material, and description.
+
+        Args:
+            search_term: Text to search for
+            limit: Maximum number of results
+            request_id: Optional request ID for logging
+
+        Returns:
+            List of Tool objects matching the search term
+        """
+        rid = request_id or get_request_id()
+
+        try:
+            with self.db_config.main_session() as session:
+                # Create a comprehensive text search across multiple fields
+                search_pattern = f'%{search_term}%'
+
+                query = session.query(Tool).options(
+                    joinedload(Tool.tool_category),
+                    joinedload(Tool.tool_manufacturer)
+                ).filter(
+                    or_(
+                        Tool.name.ilike(search_pattern),
+                        Tool.type.ilike(search_pattern),
+                        Tool.material.ilike(search_pattern),
+                        Tool.description.ilike(search_pattern)
+                    )
+                )
+
+                if limit:
+                    query = query.limit(limit)
+
+                tools = query.all()
+                info_id(f"Full-text search for '{search_term}' found {len(tools)} tools", rid)
+                return tools
+
+        except SQLAlchemyError as e:
+            error_id(f"Database error during full-text search: {e}", rid, exc_info=True)
+            raise
+        except Exception as e:
+            error_id(f"Unexpected error during full-text search: {e}", rid, exc_info=True)
+            raise
+
+    @with_request_id
+    def get_tools_by_category(self, category_id: int, include_subcategories: bool = True,
+                              request_id: Optional[str] = None) -> List[Tool]:
+        """
+        Get all tools in a specific category.
+
+        Args:
+            category_id: The category ID
+            include_subcategories: Whether to include tools from subcategories
+            request_id: Optional request ID for logging
+
+        Returns:
+            List of tools in the category
+        """
+        rid = request_id or get_request_id()
+
+        try:
+            with self.db_config.main_session() as session:
+                return Tool.get_tools_by_category(session, category_id, include_subcategories, request_id=rid)
+
+        except SQLAlchemyError as e:
+            error_id(f"Database error getting tools by category: {e}", rid, exc_info=True)
+            raise
+        except Exception as e:
+            error_id(f"Unexpected error getting tools by category: {e}", rid, exc_info=True)
+            raise
+
+    # ===================
+    # ADD OPERATIONS
+    # ===================
+
+    @with_request_id
+    def add_tool(self,
+                 name: str,
+                 tool_category_id: int,
+                 tool_manufacturer_id: int,
+                 size: Optional[str] = None,
+                 tool_type: Optional[str] = None,
+                 material: Optional[str] = None,
+                 description: Optional[str] = None,
+                 package_ids: Optional[List[int]] = None,
+                 request_id: Optional[str] = None) -> Optional[Tool]:
+        """
+        Add a new tool to the database.
+
+        Args:
+            name: Tool name
+            tool_category_id: Category ID (must exist)
+            tool_manufacturer_id: Manufacturer ID (must exist)
+            size: Tool size specification
+            tool_type: Type of tool
+            material: Material composition
+            description: Detailed description
+            package_ids: List of package IDs to associate with this tool
+            request_id: Optional request ID for logging
+
+        Returns:
+            The created Tool object or None if failed
+
+        Raises:
+            ValueError: If required references don't exist
+            IntegrityError: If database constraints are violated
+        """
+        rid = request_id or get_request_id()
+
+        try:
+            with self.db_config.main_session() as session:
+                tool = Tool.add_tool(
+                    session=session,
+                    name=name,
+                    tool_category_id=tool_category_id,
+                    tool_manufacturer_id=tool_manufacturer_id,
+                    size=size,
+                    tool_type=tool_type,
+                    material=material,
+                    description=description,
+                    request_id=rid
+                )
+
+                # Add package associations if provided
+                if tool and package_ids:
+                    self._add_tool_package_associations(session, tool.id, package_ids, rid)
+                    session.commit()
+
+                return tool
+
+        except ValueError as e:
+            error_id(f"Validation error creating tool: {e}", rid, exc_info=True)
+            raise
+        except IntegrityError as e:
+            error_id(f"Database integrity error creating tool: {e}", rid, exc_info=True)
+            raise
+        except SQLAlchemyError as e:
+            error_id(f"Database error creating tool: {e}", rid, exc_info=True)
+            raise
+        except Exception as e:
+            error_id(f"Unexpected error creating tool: {e}", rid, exc_info=True)
+            raise
+
+    @with_request_id
+    def add_tool_from_dict(self, tool_data: Dict[str, Any], request_id: Optional[str] = None) -> Optional[Tool]:
+        """
+        Add a tool from a dictionary of data.
+
+        Args:
+            tool_data: Dictionary containing tool information
+            request_id: Optional request ID for logging
+
+        Returns:
+            The created Tool object
+        """
+        rid = request_id or get_request_id()
+
+        required_fields = ['name', 'tool_category_id', 'tool_manufacturer_id']
+
+        # Validate required fields
+        for field in required_fields:
+            if field not in tool_data:
+                raise ValueError(f"Required field '{field}' is missing from tool data")
+
+        return self.add_tool(
+            name=tool_data['name'],
+            tool_category_id=tool_data['tool_category_id'],
+            tool_manufacturer_id=tool_data['tool_manufacturer_id'],
+            size=tool_data.get('size'),
+            tool_type=tool_data.get('type'),
+            material=tool_data.get('material'),
+            description=tool_data.get('description'),
+            package_ids=tool_data.get('package_ids'),
+            request_id=rid
+        )
+
+    # ===================
+    # UPDATE OPERATIONS
+    # ===================
+
+    @with_request_id
+    def update_tool(self,
+                    tool_id: int,
+                    name: Optional[str] = None,
+                    size: Optional[str] = None,
+                    tool_type: Optional[str] = None,
+                    material: Optional[str] = None,
+                    description: Optional[str] = None,
+                    tool_category_id: Optional[int] = None,
+                    tool_manufacturer_id: Optional[int] = None,
+                    package_ids: Optional[List[int]] = None,
+                    request_id: Optional[str] = None) -> Optional[Tool]:
+        """
+        Update an existing tool.
+
+        Args:
+            tool_id: ID of the tool to update
+            name: New name (if provided)
+            size: New size (if provided)
+            tool_type: New type (if provided)
+            material: New material (if provided)
+            description: New description (if provided)
+            tool_category_id: New category ID (if provided)
+            tool_manufacturer_id: New manufacturer ID (if provided)
+            package_ids: New list of package IDs (replaces existing associations)
+            request_id: Optional request ID for logging
+
+        Returns:
+            Updated Tool object if successful, None if tool not found
+        """
+        rid = request_id or get_request_id()
+
+        try:
+            with self.db_config.main_session() as session:
+                # Prepare update data
+                update_data = {}
+                if name is not None:
+                    update_data['name'] = name
+                if size is not None:
+                    update_data['size'] = size
+                if tool_type is not None:
+                    update_data['type'] = tool_type
+                if material is not None:
+                    update_data['material'] = material
+                if description is not None:
+                    update_data['description'] = description
+                if tool_category_id is not None:
+                    update_data['tool_category_id'] = tool_category_id
+                if tool_manufacturer_id is not None:
+                    update_data['tool_manufacturer_id'] = tool_manufacturer_id
+
+                # Update the tool
+                tool = Tool.update_tool(session, tool_id, request_id=rid, **update_data)
+
+                # Update package associations if provided
+                if tool and package_ids is not None:
+                    # Remove existing associations
+                    session.execute(
+                        tool_package_association.delete().where(
+                            tool_package_association.c.tool_id == tool_id
+                        )
+                    )
+                    # Add new associations
+                    if package_ids:
+                        self._add_tool_package_associations(session, tool_id, package_ids, rid)
+                    session.commit()
+
+                return tool
+
+        except ValueError as e:
+            error_id(f"Validation error updating tool: {e}", rid, exc_info=True)
+            raise
+        except SQLAlchemyError as e:
+            error_id(f"Database error updating tool: {e}", rid, exc_info=True)
+            raise
+        except Exception as e:
+            error_id(f"Unexpected error updating tool: {e}", rid, exc_info=True)
+            raise
+
+    # ===================
+    # DELETE OPERATIONS
+    # ===================
+
+    @with_request_id
+    def delete_tool(self, tool_id: int, force: bool = False, request_id: Optional[str] = None) -> bool:
+        """
+        Delete a tool from the database.
+
+        Args:
+            tool_id: ID of the tool to delete
+            force: If True, will delete even if tool has dependencies
+            request_id: Optional request ID for logging
+
+        Returns:
+            True if deletion was successful, False if tool not found
+
+        Raises:
+            ValueError: If tool has dependencies and force=False
+        """
+        rid = request_id or get_request_id()
+
+        try:
+            with self.db_config.main_session() as session:
+                return Tool.delete_tool(session, tool_id, force, request_id=rid)
+
+        except ValueError as e:
+            error_id(f"Validation error deleting tool: {e}", rid, exc_info=True)
+            raise
+        except SQLAlchemyError as e:
+            error_id(f"Database error deleting tool: {e}", rid, exc_info=True)
+            raise
+        except Exception as e:
+            error_id(f"Unexpected error deleting tool: {e}", rid, exc_info=True)
+            raise
+
+    @with_request_id
+    def delete_tools_by_category(self, category_id: int, force: bool = False, request_id: Optional[str] = None) -> int:
+        """
+        Delete all tools in a specific category.
+
+        Args:
+            category_id: Category ID
+            force: If True, will delete even if tools have dependencies
+            request_id: Optional request ID for logging
+
+        Returns:
+            Number of tools deleted
+        """
+        rid = request_id or get_request_id()
+
+        try:
+            tools = self.get_tools_by_category(category_id, include_subcategories=False, request_id=rid)
+            deleted_count = 0
+
+            for tool in tools:
+                if self.delete_tool(tool.id, force=force, request_id=rid):
+                    deleted_count += 1
+
+            info_id(f"Deleted {deleted_count} tools from category {category_id}", rid)
+            return deleted_count
+
+        except Exception as e:
+            error_id(f"Error deleting tools by category: {e}", rid, exc_info=True)
+            raise
+
+    @with_request_id
+    def delete_tools_by_manufacturer(self, manufacturer_id: int, force: bool = False,
+                                     request_id: Optional[str] = None) -> int:
+        """
+        Delete all tools from a specific manufacturer.
+
+        Args:
+            manufacturer_id: Manufacturer ID
+            force: If True, will delete even if tools have dependencies
+            request_id: Optional request ID for logging
+
+        Returns:
+            Number of tools deleted
+        """
+        rid = request_id or get_request_id()
+
+        try:
+            with self.db_config.main_session() as session:
+                tools = Tool.get_tools_by_manufacturer(session, manufacturer_id, request_id=rid)
+
+                deleted_count = 0
+                for tool in tools:
+                    if self.delete_tool(tool.id, force=force, request_id=rid):
+                        deleted_count += 1
+
+                info_id(f"Deleted {deleted_count} tools from manufacturer {manufacturer_id}", rid)
+                return deleted_count
+
+        except Exception as e:
+            error_id(f"Error deleting tools by manufacturer: {e}", rid, exc_info=True)
+            raise
+
+    # ===================
+    # UTILITY METHODS
+    # ===================
+
+    def _add_tool_package_associations(self, session, tool_id: int, package_ids: List[int], request_id: str):
+        """Add tool-package associations."""
+        for package_id in package_ids:
+            # Validate package exists
+            package = session.query(ToolPackage).filter(ToolPackage.id == package_id).first()
+            if not package:
+                raise ValueError(f"Tool package with ID {package_id} does not exist")
+
+            # Add association
+            association = tool_package_association.insert().values(
+                tool_id=tool_id,
+                package_id=package_id,
+                quantity=1  # Default quantity
+            )
+            session.execute(association)
+
+    def _check_tool_dependencies(self, session, tool_id: int, request_id: str) -> List[str]:
+        """Check if a tool has dependencies that would prevent deletion."""
+        dependencies = []
+
+        # Check tool packages
+        package_count = session.query(func.count()).select_from(
+            tool_package_association
+        ).filter(tool_package_association.c.tool_id == tool_id).scalar()
+        if package_count > 0:
+            dependencies.append(f"{package_count} package associations")
+
+        # Check tool images
+        image_count = session.query(ToolImageAssociation).filter(
+            ToolImageAssociation.tool_id == tool_id
+        ).count()
+        if image_count > 0:
+            dependencies.append(f"{image_count} image associations")
+
+        # Check tool positions
+        position_count = session.query(ToolPositionAssociation).filter(
+            ToolPositionAssociation.tool_id == tool_id
+        ).count()
+        if position_count > 0:
+            dependencies.append(f"{position_count} position associations")
+
+        return dependencies
+
+    # ===================
+    # STATISTICS AND REPORTING
+    # ===================
+
+    @with_request_id
+    def get_tool_statistics(self, request_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get comprehensive statistics about tools in the database."""
+        rid = request_id or get_request_id()
+
+        try:
+            with self.db_config.main_session() as session:
+                stats = {}
+
+                # Total tool count
+                stats['total_tools'] = session.query(Tool).count()
+
+                # Tools by category
+                category_stats = session.query(
+                    ToolCategory.name,
+                    func.count(Tool.id).label('count')
+                ).join(Tool).group_by(ToolCategory.name).all()
+                stats['tools_by_category'] = {name: count for name, count in category_stats}
+
+                # Tools by manufacturer
+                manufacturer_stats = session.query(
+                    ToolManufacturer.name,
+                    func.count(Tool.id).label('count')
+                ).join(Tool).group_by(ToolManufacturer.name).all()
+                stats['tools_by_manufacturer'] = {name: count for name, count in manufacturer_stats}
+
+                # Tools by type
+                type_stats = session.query(
+                    Tool.type,
+                    func.count(Tool.id).label('count')
+                ).filter(Tool.type.isnot(None)).group_by(Tool.type).all()
+                stats['tools_by_type'] = {tool_type or 'Unknown': count for tool_type, count in type_stats}
+
+                # Tools by material
+                material_stats = session.query(
+                    Tool.material,
+                    func.count(Tool.id).label('count')
+                ).filter(Tool.material.isnot(None)).group_by(Tool.material).all()
+                stats['tools_by_material'] = {material or 'Unknown': count for material, count in material_stats}
+
+                info_id(f"Generated tool statistics: {stats['total_tools']} total tools", rid)
+                return stats
+
+        except SQLAlchemyError as e:
+            error_id(f"Database error generating tool statistics: {e}", rid, exc_info=True)
+            raise
+        except Exception as e:
+            error_id(f"Unexpected error generating tool statistics: {e}", rid, exc_info=True)
+            raise
+
+
+# ===========================================
+# CONVENIENCE FUNCTIONS
+# ===========================================
+
+def create_tool_manager(db_config: DatabaseConfig = None) -> ToolManager:
+    """Create a new ToolManager instance."""
+    return ToolManager(db_config)
+
+
+def get_default_tool_manager() -> ToolManager:
+    """Get a default ToolManager instance with standard database config."""
+    return ToolManager(DatabaseConfig())
+
+
+# ===========================================
+# MODULE EXPORTS
+# ===========================================
+
+__all__ = [
+    # Models
+    'Tool',
+    'ToolCategory',
+    'ToolManufacturer',
+    'ToolPackage',
+    'ToolImageAssociation',
+    'ToolPositionAssociation',
+
+    # Manager
+    'ToolManager',
+
+    # Convenience functions
+    'create_tool_manager',
+    'get_default_tool_manager',
+
+    # Association table
+    'tool_package_association',
+]
