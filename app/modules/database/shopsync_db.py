@@ -1,4 +1,33 @@
+# Standard library
+from typing import Optional, List
+from sqlalchemy import Column
+from sqlalchemy.types import JSON
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import Column, Enum, ForeignKey, Index, Integer, String, UniqueConstraint, select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, joinedload, relationship
+from sqlalchemy.orm import relationship, Session, joinedload
+from sqlalchemy.exc import SQLAlchemyError
 
+# Base class for models
+from app.modules.configuration.base import Base  # <-- from your base.py file
+
+# Database configuration (for sessions)
+from app.modules.database.db_manager import ShopSyncDatabase  # <-- for get_main_session()
+
+# Logging utilities & decorators
+from app.modules.configuration.log_config import (
+    logger,
+    with_request_id,
+    info_id,
+    debug_id,
+    warning_id,
+    error_id
+)
+
+DatabaseConfig = ShopSyncDatabase
+
+# Web framework dependency removed; request_id is provided via @with_request_id
 # Main Tables
 class SiteLocation(Base):
     __tablename__ = 'site_location'
@@ -387,7 +416,7 @@ class Position(Base):
                                        model_id=None, asset_number_id=None, location_id=None,
                                        request_id='no_request_id'):
         """
-        Search for corresponding Position IDs based on the provided filters with request ID logging.
+        Search for corresponding Position IDs based on the provided filters with request ID logging
 
         Args:
             session: SQLAlchemy session (Optional)
@@ -406,7 +435,7 @@ class Position(Base):
             session = DatabaseConfig().get_main_session()
 
         # Log input parameters with request ID
-        logging.info(
+        info_id(
             f"[{request_id}] get_corresponding_position_ids called with "
             f"area_id={area_id}, equipment_group_id={equipment_group_id}, "
             f"model_id={model_id}, asset_number_id={asset_number_id}, "
@@ -429,12 +458,12 @@ class Position(Base):
             position_ids = [position.id for position in positions]
 
             # Log the result
-            logging.info(f"[{request_id}] Retrieved {len(position_ids)} Position IDs")
+            info_id(f"[{request_id}] Retrieved {len(position_ids)} Position IDs")
             return position_ids
 
         except SQLAlchemyError as e:
             # Log any errors encountered during the query
-            logging.error(
+            error_id(
                 f"[{request_id}] Error in get_corresponding_position_ids: {str(e)}",
                 exc_info=True
             )
@@ -443,7 +472,7 @@ class Position(Base):
     @classmethod
     @with_request_id
     def _get_positions_by_hierarchy(cls, session, area_id=None, equipment_group_id=None, model_id=None,
-                                    asset_number_id=None, location_id=None):
+                                    asset_number_id=None, location_id=None, request_id=None):
         """
         Helper method to fetch positions based on hierarchical filters.
 
@@ -468,25 +497,25 @@ class Position(Base):
             filters['location_id'] = location_id
 
         # Log the filter parameters
-        debug_id(f"Filtering Positions with filters: {filters}", request_id=g.request_id)
+        debug_id(f"Filtering Positions with filters: {filters}", request_id=request_id)
 
         try:
             # Query the Position table based on the filters
             query = session.query(Position).filter_by(**filters)
 
             # Log the query execution
-            info_id(f"Executing query for positions with {len(filters)} filters.", request_id=g.request_id)
+            info_id(f"Executing query for positions with {len(filters)} filters.", request_id=request_id)
 
             # Return the positions matching the filter
             positions = query.all()
 
             # Log the result
-            info_id(f"Retrieved {len(positions)} positions.", request_id=g.request_id)
+            info_id(f"Retrieved {len(positions)} positions.", request_id=request_id)
             return positions
 
         except SQLAlchemyError as e:
             # Log any errors encountered during the query
-            error_id(f"Error in _get_positions_by_hierarchy: {str(e)}", exc_info=True, request_id=g.request_id)
+            error_id(f"Error in _get_positions_by_hierarchy: {str(e)}", exc_info=True, request_id=request_id)
             raise
 
 class Area(Base):
@@ -1224,7 +1253,7 @@ class AssetNumber(Base):
 
             if results:
                 assets = []
-                # Loop through the found results to build a structured list with detailed logging.
+                # Loop through the found results to build a structured list with detailed logging
                 for asset in results:
                     asset_details = {
                         "id": asset.id,
@@ -1534,19 +1563,22 @@ class Container(Base):
             raise ValueError("code and name are required.")
         return c, n
 
+
     @classmethod
     @with_request_id
-    def add_container(cls, session: Session, position_id: int, code: str, name: str, description: str = None, request_id=None):
+    def add_container(cls, session: Session, position_id: int, code: str, name: str,
+                      description: str = None, request_id=None):
         code, name = cls._norm(code, name)
-        obj = cls(position_id=position_id, code=code, name=name, description=(description or "").strip() or None)
+        obj = cls(position_id=position_id, code=code, name=name,
+                  description=(description or "").strip() or None)
         session.add(obj)
         try:
             session.commit()
-            logger.info(f"Created Container '{code}' on position {position_id}", extra={'request_id': request_id} if request_id else None)
+            info_id("Created Container '%s' on position %s", code, position_id, request_id=request_id)
             return obj
         except SQLAlchemyError:
             session.rollback()
-            logger.exception("Failed to create Container", extra={'request_id': request_id} if request_id else None)
+            error_id("Failed to create Container", exc_info=True, request_id=request_id)
             raise
 
     @classmethod
@@ -1554,29 +1586,31 @@ class Container(Base):
     def delete_container(cls, session: Session, container_id: int, request_id=None) -> bool:
         obj = session.get(cls, container_id)
         if not obj:
-            logger.warning(f"Container {container_id} not found", extra={'request_id': request_id} if request_id else None)
+            warning_id("Container %s not found", container_id, request_id=request_id)
             return False
         session.delete(obj)
         try:
             session.commit()
-            logger.info(f"Deleted Container {container_id}", extra={'request_id': request_id} if request_id else None)
+            info_id("Deleted Container %s", container_id, request_id=request_id)
             return True
         except SQLAlchemyError:
             session.rollback()
-            logger.exception("Failed to delete Container", extra={'request_id': request_id} if request_id else None)
+            error_id("Failed to delete Container", exc_info=True, request_id=request_id)
             raise
 
     @classmethod
     @with_request_id
-    def find_or_create(cls, session: Session, position_id: int, code: str, name: str, description: str = None, request_id=None):
+    def find_or_create(cls, session: Session, position_id: int, code: str, name: str,
+                       description: str = None, request_id=None):
         code, name = cls._norm(code, name)
         existing = session.execute(
             select(cls).where(cls.position_id == position_id, cls.code == code)
         ).scalar_one_or_none()
         if existing:
-            logger.info(f"Found Container '{code}' on position {position_id}", extra={'request_id': request_id} if request_id else None)
+            info_id("Found Container '%s' on position %s", code, position_id, request_id=request_id)
             return existing
-        return cls.add_container(session, position_id, code, name, description=description, request_id=request_id)
+        return cls.add_container(session, position_id, code, name,
+                                 description=description, request_id=request_id)
 
     @classmethod
     @with_request_id
@@ -1594,7 +1628,8 @@ class Shelf(Base):
 
     id = Column(Integer, primary_key=True)
     position_id = Column(Integer, ForeignKey("position.id", ondelete="CASCADE"), nullable=False)
-    container_id = Column(Integer, ForeignKey("container.id", ondelete="CASCADE"), nullable=True)  # shelf can be directly on equipment (no container)
+    # shelf can be directly on equipment (no container)
+    container_id = Column(Integer, ForeignKey("container.id", ondelete="CASCADE"), nullable=True)
     code = Column(String, nullable=False)
     name = Column(String, nullable=False)
     description = Column(String, nullable=True)
@@ -1624,18 +1659,36 @@ class Shelf(Base):
 
     @classmethod
     @with_request_id
-    def add_shelf(cls, session: Session, position_id: int, code: str, name: str, container_id: int | None = None, description: str = None, request_id=None):
+    def add_shelf(
+        cls,
+        session: Session,
+        position_id: int,
+        code: str,
+        name: str,
+        container_id: int | None = None,
+        description: str | None = None,
+        request_id=None,
+    ):
         code, name = cls._norm(code, name)
-        obj = cls(position_id=position_id, container_id=container_id, code=code, name=name, description=(description or "").strip() or None)
+        obj = cls(
+            position_id=position_id,
+            container_id=container_id,
+            code=code,
+            name=name,
+            description=(description or "").strip() or None,
+        )
         session.add(obj)
         try:
             session.commit()
             where = f"container={container_id}" if container_id else "no-container"
-            logger.info(f"Created Shelf '{code}' on position {position_id} ({where})", extra={'request_id': request_id} if request_id else None)
+            info_id(
+                "Created Shelf '%s' on position %s (%s)",
+                code, position_id, where, request_id=request_id
+            )
             return obj
         except SQLAlchemyError:
             session.rollback()
-            logger.exception("Failed to create Shelf", extra={'request_id': request_id} if request_id else None)
+            error_id("Failed to create Shelf", exc_info=True, request_id=request_id)
             raise
 
     @classmethod
@@ -1643,33 +1696,50 @@ class Shelf(Base):
     def delete_shelf(cls, session: Session, shelf_id: int, request_id=None) -> bool:
         obj = session.get(cls, shelf_id)
         if not obj:
-            logger.warning(f"Shelf {shelf_id} not found", extra={'request_id': request_id} if request_id else None)
+            warning_id("Shelf %s not found", shelf_id, request_id=request_id)
             return False
         session.delete(obj)
         try:
             session.commit()
-            logger.info(f"Deleted Shelf {shelf_id}", extra={'request_id': request_id} if request_id else None)
+            info_id("Deleted Shelf %s", shelf_id, request_id=request_id)
             return True
         except SQLAlchemyError:
             session.rollback()
-            logger.exception("Failed to delete Shelf", extra={'request_id': request_id} if request_id else None)
+            error_id("Failed to delete Shelf", exc_info=True, request_id=request_id)
             raise
 
     @classmethod
     @with_request_id
-    def find_or_create(cls, session: Session, position_id: int, code: str, name: str, container_id: int | None = None, description: str = None, request_id=None):
+    def find_or_create(
+        cls,
+        session: Session,
+        position_id: int,
+        code: str,
+        name: str,
+        container_id: int | None = None,
+        description: str | None = None,
+        request_id=None,
+    ):
         code, name = cls._norm(code, name)
         existing = session.execute(
             select(cls).where(
                 cls.position_id == position_id,
-                cls.container_id.is_(container_id) if container_id is None else cls.container_id == container_id,
+                (cls.container_id.is_(container_id) if container_id is None else cls.container_id == container_id),
                 cls.code == code,
             )
         ).scalar_one_or_none()
         if existing:
-            logger.info(f"Found Shelf '{code}' on position {position_id}", extra={'request_id': request_id} if request_id else None)
+            info_id("Found Shelf '%s' on position %s", code, position_id, request_id=request_id)
             return existing
-        return cls.add_shelf(session, position_id, code, name, container_id=container_id, description=description, request_id=request_id)
+        return cls.add_shelf(
+            session,
+            position_id,
+            code,
+            name,
+            container_id=container_id,
+            description=description,
+            request_id=request_id,
+        )
 
     @classmethod
     @with_request_id
@@ -1678,7 +1748,7 @@ class Shelf(Base):
             select(cls).options(joinedload(cls.drawers)).where(cls.id == shelf_id)
         ).scalar_one_or_none()
         if not obj:
-            logger.warning(f"Shelf {shelf_id} not found", extra={'request_id': request_id} if request_id else None)
+            warning_id("Shelf %s not found", shelf_id, request_id=request_id)
             return None
         return {"shelf": obj, "downward": {"drawers": obj.drawers}}
 
@@ -1687,7 +1757,8 @@ class Drawer(Base):
 
     id = Column(Integer, primary_key=True)
     position_id = Column(Integer, ForeignKey("position.id", ondelete="CASCADE"), nullable=False)
-    shelf_id = Column(Integer, ForeignKey("shelf.id", ondelete="CASCADE"), nullable=True)  # drawer can be directly on equipment (no shelf)
+    # drawer can be directly on equipment (no shelf)
+    shelf_id = Column(Integer, ForeignKey("shelf.id", ondelete="CASCADE"), nullable=True)
     code = Column(String, nullable=False)
     name = Column(String, nullable=False)
     description = Column(String, nullable=True)
@@ -1716,18 +1787,36 @@ class Drawer(Base):
 
     @classmethod
     @with_request_id
-    def add_drawer(cls, session: Session, position_id: int, code: str, name: str, shelf_id: int | None = None, description: str = None, request_id=None):
+    def add_drawer(
+        cls,
+        session: Session,
+        position_id: int,
+        code: str,
+        name: str,
+        shelf_id: int | None = None,
+        description: str | None = None,
+        request_id=None,
+    ):
         code, name = cls._norm(code, name)
-        obj = cls(position_id=position_id, shelf_id=shelf_id, code=code, name=name, description=(description or "").strip() or None)
+        obj = cls(
+            position_id=position_id,
+            shelf_id=shelf_id,
+            code=code,
+            name=name,
+            description=(description or "").strip() or None,
+        )
         session.add(obj)
         try:
             session.commit()
             where = f"shelf={shelf_id}" if shelf_id else "no-shelf"
-            logger.info(f"Created Drawer '{code}' on position {position_id} ({where})", extra={'request_id': request_id} if request_id else None)
+            info_id(
+                "Created Drawer '%s' on position %s (%s)",
+                code, position_id, where, request_id=request_id
+            )
             return obj
         except SQLAlchemyError:
             session.rollback()
-            logger.exception("Failed to create Drawer", extra={'request_id': request_id} if request_id else None)
+            error_id("Failed to create Drawer", exc_info=True, request_id=request_id)
             raise
 
     @classmethod
@@ -1735,33 +1824,44 @@ class Drawer(Base):
     def delete_drawer(cls, session: Session, drawer_id: int, request_id=None) -> bool:
         obj = session.get(cls, drawer_id)
         if not obj:
-            logger.warning(f"Drawer {drawer_id} not found", extra={'request_id': request_id} if request_id else None)
+            warning_id("Drawer %s not found", drawer_id, request_id=request_id)
             return False
         session.delete(obj)
         try:
             session.commit()
-            logger.info(f"Deleted Drawer {drawer_id}", extra={'request_id': request_id} if request_id else None)
+            info_id("Deleted Drawer %s", drawer_id, request_id=request_id)
             return True
         except SQLAlchemyError:
             session.rollback()
-            logger.exception("Failed to delete Drawer", extra={'request_id': request_id} if request_id else None)
+            error_id("Failed to delete Drawer", exc_info=True, request_id=request_id)
             raise
 
     @classmethod
     @with_request_id
-    def find_or_create(cls, session: Session, position_id: int, code: str, name: str, shelf_id: int | None = None, description: str = None, request_id=None):
+    def find_or_create(
+        cls,
+        session: Session,
+        position_id: int,
+        code: str,
+        name: str,
+        shelf_id: int | None = None,
+        description: str | None = None,
+        request_id=None,
+    ):
         code, name = cls._norm(code, name)
         existing = session.execute(
             select(cls).where(
                 cls.position_id == position_id,
-                cls.shelf_id.is_(shelf_id) if shelf_id is None else cls.shelf_id == shelf_id,
+                (cls.shelf_id.is_(shelf_id) if shelf_id is None else cls.shelf_id == shelf_id),
                 cls.code == code,
             )
         ).scalar_one_or_none()
         if existing:
-            logger.info(f"Found Drawer '{code}' on position {position_id}", extra={'request_id': request_id} if request_id else None)
+            info_id("Found Drawer '%s' on position %s", code, position_id, request_id=request_id)
             return existing
-        return cls.add_drawer(session, position_id, code, name, shelf_id=shelf_id, description=description, request_id=request_id)
+        return cls.add_drawer(
+            session, position_id, code, name, shelf_id=shelf_id, description=description, request_id=request_id
+        )
 
     @classmethod
     @with_request_id
@@ -1770,14 +1870,13 @@ class Drawer(Base):
             select(cls).options(joinedload(cls.slots)).where(cls.id == drawer_id)
         ).scalar_one_or_none()
         if not obj:
-            logger.warning(f"Drawer {drawer_id} not found", extra={'request_id': request_id} if request_id else None)
+            warning_id("Drawer %s not found", drawer_id, request_id=request_id)
             return None
         return {"drawer": obj, "downward": {"slots": obj.slots}}
 
 class DrawerSlot(Base):
     """
-    A specific "position in drawer" — you can address by a label or row/column.
-    Attach parts to a slot via your own association table if needed.
+    A specific "position in drawer" — addressable by a label (e.g., 'A5') or row/col.
     """
     __tablename__ = "drawer_slot"
 
@@ -1798,9 +1897,25 @@ class DrawerSlot(Base):
         Index("ix_drawer_slot_label", "slot_label"),
     )
 
+    inventories = relationship(
+        "Inventory",
+        back_populates="drawer_slot",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
     @classmethod
     @with_request_id
-    def add_slot(cls, session: Session, drawer_id: int, *, slot_label: str | None = None, row_index: int | None = None, col_index: int | None = None, note: str | None = None, request_id=None):
+    def add_slot(
+        cls,
+        session: Session,
+        drawer_id: int,
+        *,
+        slot_label: str | None = None,
+        row_index: int | None = None,
+        col_index: int | None = None,
+        note: str | None = None,
+        request_id=None,
+    ):
         if not slot_label and row_index is None and col_index is None:
             raise ValueError("Provide slot_label or row/col to identify a slot.")
         obj = cls(
@@ -1814,11 +1929,11 @@ class DrawerSlot(Base):
         try:
             session.commit()
             where = slot_label or f"r{row_index}c{col_index}"
-            logger.info(f"Created DrawerSlot '{where}' in drawer {drawer_id}", extra={'request_id': request_id} if request_id else None)
+            info_id("Created DrawerSlot '%s' in drawer %s", where, drawer_id, request_id=request_id)
             return obj
         except SQLAlchemyError:
             session.rollback()
-            logger.exception("Failed to create DrawerSlot", extra={'request_id': request_id} if request_id else None)
+            error_id("Failed to create DrawerSlot", exc_info=True, request_id=request_id)
             raise
 
     @classmethod
@@ -1826,38 +1941,55 @@ class DrawerSlot(Base):
     def delete_slot(cls, session: Session, slot_id: int, request_id=None) -> bool:
         obj = session.get(cls, slot_id)
         if not obj:
-            logger.warning(f"DrawerSlot {slot_id} not found", extra={'request_id': request_id} if request_id else None)
+            warning_id("DrawerSlot %s not found", slot_id, request_id=request_id)
             return False
         session.delete(obj)
         try:
             session.commit()
-            logger.info(f"Deleted DrawerSlot {slot_id}", extra={'request_id': request_id} if request_id else None)
+            info_id("Deleted DrawerSlot %s", slot_id, request_id=request_id)
             return True
         except SQLAlchemyError:
             session.rollback()
-            logger.exception("Failed to delete DrawerSlot", extra={'request_id': request_id} if request_id else None)
+            error_id("Failed to delete DrawerSlot", exc_info=True, request_id=request_id)
             raise
 
     @classmethod
     @with_request_id
-    def find_or_create(cls, session: Session, drawer_id: int, *, slot_label: str | None = None, row_index: int | None = None, col_index: int | None = None, note: str | None = None, request_id=None):
+    def find_or_create(
+        cls,
+        session: Session,
+        drawer_id: int,
+        *,
+        slot_label: str | None = None,
+        row_index: int | None = None,
+        col_index: int | None = None,
+        note: str | None = None,
+        request_id=None,
+    ):
         if slot_label:
             existing = session.execute(
                 select(cls).where(cls.drawer_id == drawer_id, cls.slot_label == slot_label.strip())
             ).scalar_one_or_none()
             if existing:
                 return existing
-        # For row/col addressing we don’t enforce uniqueness here, but you can add a UNIQUE on (drawer_id,row_index,col_index) if you want strict grid semantics.
-        return cls.add_slot(session, drawer_id, slot_label=slot_label, row_index=row_index, col_index=col_index, note=note, request_id=request_id)
+        # (Optional) add UNIQUE(drawer_id,row_index,col_index) if you need strict grid semantics.
+        return cls.add_slot(
+            session,
+            drawer_id,
+            slot_label=slot_label,
+            row_index=row_index,
+            col_index=col_index,
+            note=note,
+            request_id=request_id,
+        )
 
     @classmethod
     @with_request_id
     def find_related_entities(cls, session: Session, slot_id: int, request_id=None):
         obj = session.get(cls, slot_id)
         if not obj:
-            logger.warning(f"DrawerSlot {slot_id} not found", extra={'request_id': request_id} if request_id else None)
+            warning_id("DrawerSlot %s not found", slot_id, request_id=request_id)
             return None
-        # Add any “downward” relations here if you later link parts or images to a slot
         return {"drawer_slot": obj, "downward": {}}
 
 class Part(Base):
@@ -1949,37 +2081,43 @@ class Part(Base):
 
 class Inventory(Base):
     """
-    Stock record: how much of a Part exists at a given storage node (e.g., a specific slot).
-    Works with the polymorphic StorageNode design:
-        Inventory.part_id -> Part.id
-        Inventory.storage_node_id -> StorageNode.id
+    Stock record: how much of a Part exists at a given drawer slot.
+        Inventory.part_id        -> Part.id
+        Inventory.drawer_slot_id -> DrawerSlot.id
     """
     __tablename__ = "inventory"
 
-    id               = Column(Integer, primary_key=True)
-    part_id          = Column(Integer, ForeignKey("part.id", ondelete="CASCADE"), nullable=False)
-    storage_node_id  = Column(Integer, ForeignKey("storage_node.id", ondelete="CASCADE"), nullable=False)
-    quantity         = Column(Integer, nullable=False, default=0)
+    id = Column(Integer, primary_key=True)
+    part_id = Column(Integer, ForeignKey("part.id", ondelete="CASCADE"), nullable=False)
+    drawer_slot_id = Column(Integer, ForeignKey("drawer_slot.id", ondelete="CASCADE"), nullable=False)
+    quantity = Column(Integer, nullable=False, default=0)
 
-    part         = relationship("Part", back_populates="inventories")
-    storage_node = relationship("StorageNode")  # no back_populates needed unless you want it
+    part = relationship("Part", back_populates="inventories")
+    drawer_slot = relationship("DrawerSlot", back_populates="inventories")
 
     __table_args__ = (
-        UniqueConstraint("part_id", "storage_node_id", name="uq_inventory_part_node"),
-        Index("ix_inventory_node", "storage_node_id"),
+        UniqueConstraint("part_id", "drawer_slot_id", name="uq_inventory_part_slot"),
+        Index("ix_inventory_slot", "drawer_slot_id"),
     )
 
     # -------- adjustments / transfers --------
     @classmethod
     @with_request_id
-    def adjust(cls, session: Session, *, part_id: int, storage_node_id: int, delta: int, request_id=None) -> "Inventory":
-        """
-        Add/remove quantity at a node (positive delta adds, negative removes).
-        """
+    def adjust(
+        cls,
+        session: Session,
+        *,
+        part_id: int,
+        drawer_slot_id: int,
+        delta: int,
+        request_id=None,
+    ) -> "Inventory":
+        """Add/remove quantity at a slot (positive delta adds, negative removes)."""
         if delta == 0:
             raise ValueError("delta must be non-zero.")
+
         row = session.execute(
-            select(cls).where(cls.part_id == part_id, cls.storage_node_id == storage_node_id)
+            select(cls).where(cls.part_id == part_id, cls.drawer_slot_id == drawer_slot_id)
         ).scalar_one_or_none()
 
         if row:
@@ -1990,59 +2128,66 @@ class Inventory(Base):
         else:
             if delta < 0:
                 raise ValueError("Cannot create inventory with negative quantity.")
-            row = cls(part_id=part_id, storage_node_id=storage_node_id, quantity=delta)
+            row = cls(part_id=part_id, drawer_slot_id=drawer_slot_id, quantity=delta)
             session.add(row)
 
         try:
             session.commit()
-            logger.info(
-                f"Adjusted stock part={part_id} node={storage_node_id} by {delta} → qty={row.quantity}",
-                extra={'request_id': request_id} if request_id else None,
+            info_id(
+                "Adjusted stock part=%s slot=%s by %s → qty=%s",
+                part_id, drawer_slot_id, delta, row.quantity, request_id=request_id
             )
             return row
         except SQLAlchemyError:
             session.rollback()
-            logger.exception("Failed to adjust inventory", extra={'request_id': request_id} if request_id else None)
+            error_id("Failed to adjust inventory", exc_info=True, request_id=request_id)
             raise
 
     @classmethod
     @with_request_id
-    def transfer(cls, session: Session, *, part_id: int, from_node_id: int, to_node_id: int, qty: int, request_id=None) -> tuple["Inventory","Inventory"]:
-        """
-        Move qty of a part from one node to another.
-        """
+    def transfer(
+        cls,
+        session: Session,
+        *,
+        part_id: int,
+        from_slot_id: int,
+        to_slot_id: int,
+        qty: int,
+        request_id=None,
+    ) -> tuple["Inventory", "Inventory"]:
+        """Move qty of a part from one slot to another."""
         if qty <= 0:
             raise ValueError("qty must be positive.")
 
         # decrement source
         src = session.execute(
-            select(cls).where(cls.part_id == part_id, cls.storage_node_id == from_node_id)
+            select(cls).where(cls.part_id == part_id, cls.drawer_slot_id == from_slot_id)
         ).scalar_one_or_none()
         if not src or (src.quantity or 0) < qty:
             have = src.quantity if src else 0
             raise ValueError(f"Insufficient stock at source (have {have}, need {qty}).")
         src.quantity = src.quantity - qty
 
-        # increment dest
+        # increment destination
         dst = session.execute(
-            select(cls).where(cls.part_id == part_id, cls.storage_node_id == to_node_id)
+            select(cls).where(cls.part_id == part_id, cls.drawer_slot_id == to_slot_id)
         ).scalar_one_or_none()
         if dst:
             dst.quantity = (dst.quantity or 0) + qty
         else:
-            dst = cls(part_id=part_id, storage_node_id=to_node_id, quantity=qty)
+            dst = cls(part_id=part_id, drawer_slot_id=to_slot_id, quantity=qty)
             session.add(dst)
 
         try:
             session.commit()
-            logger.info(
-                f"Transferred part={part_id} qty={qty} from node={from_node_id} to node={to_node_id}",
-                extra={'request_id': request_id} if request_id else None,
+            info_id(
+                "Transferred part=%s qty=%s from slot=%s to slot=%s",
+                part_id, qty, from_slot_id, to_slot_id, request_id=request_id
             )
             return src, dst
         except SQLAlchemyError:
             session.rollback()
-            logger.exception("Failed to transfer inventory", extra={'request_id': request_id} if request_id else None)
+            error_id("Failed to transfer inventory", exc_info=True, request_id=request_id)
             raise
 
 class DrawingType(Enum):
@@ -2171,5 +2316,1302 @@ class Drawing(Base):
                        session: Optional[Session] = None) -> List['Drawing']:
         return cls.search(drw_type=drawing_type, request_id=request_id, session=session)
 
+class ImagePositionAssociation(Base):
+    __tablename__ = 'image_position_association'
+    id = Column(Integer, primary_key=True)
+    image_id = Column(Integer, ForeignKey('image.id'), nullable=False)
+    position_id = Column(Integer, ForeignKey('position.id'), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('image_id', 'position_id', name='uq_image_position'),
+        Index('ix_image_position_image_id', 'image_id'),
+        Index('ix_image_position_position_id', 'position_id'),
+    )
+
+    image = relationship("Image", back_populates="image_position_association")
+    position = relationship("Position", back_populates="image_position_association")
+
+    @classmethod
+    @with_request_id
+    def associate_image_position(cls,
+                                 image_id: int,
+                                 position_id: int,
+                                 request_id: Optional[str] = None,
+                                 session: Optional[Session] = None) -> Optional['ImagePositionAssociation']:
+        """
+        Associate an image with a position.
+
+        Args:
+            image_id: ID of the image to associate
+            position_id: ID of the position to associate
+            request_id: Optional request ID for tracking this operation in logs
+            session: Optional SQLAlchemy session. If None, a new session will be created
+
+        Returns:
+            The created ImagePositionAssociation object if successful, None otherwise
+        """
+        # Get or use the provided request_id
+        rid = request_id or get_request_id()
+
+        # Get a database session if one wasn't provided
+        db_config = DatabaseConfig()
+        session_provided = session is not None
+        if not session_provided:
+            session = db_config.get_main_session()
+            debug_id(f"Created new database session for ImagePositionAssociation.associate_image_position", rid)
+
+        # Log the operation with request ID
+        debug_id(
+            f"Starting ImagePositionAssociation.associate_image_position with parameters: image_id={image_id}, position_id={position_id}",
+            rid)
+
+        try:
+            # Use the timed operation context manager with request ID
+            with log_timed_operation("ImagePositionAssociation.associate_image_position", rid):
+
+                # Check if image exists
+                image = session.query(Image).filter(Image.id == image_id).first()
+                if not image:
+                    error_id(
+                        f"Error in ImagePositionAssociation.associate_image_position: Image with ID {image_id} not found",
+                        rid)
+                    return None
+
+                # Check if position exists
+                position = session.query(Position).filter(Position.id == position_id).first()
+                if not position:
+                    error_id(
+                        f"Error in ImagePositionAssociation.associate_image_position: Position with ID {position_id} not found",
+                        rid)
+                    return None
+
+                # Check if association already exists
+                existing = session.query(cls).filter(
+                    cls.image_id == image_id,
+                    cls.position_id == position_id
+                ).first()
+
+                if existing:
+                    debug_id(f"Association between image {image_id} and position {position_id} already exists", rid)
+                    return existing
+
+                # Create new association
+                association = cls(image_id=image_id, position_id=position_id)
+                session.add(association)
+
+                # Commit if we created the session
+                if not session_provided:
+                    session.commit()
+                    debug_id(f"Committed new association between image {image_id} and position {position_id}", rid)
+
+                return association
+
+        except Exception as e:
+            error_id(f"Error in ImagePositionAssociation.associate_image_position: {str(e)}", rid, exc_info=True)
+            if not session_provided:
+                session.rollback()
+                debug_id(f"Rolled back transaction in ImagePositionAssociation.associate_image_position", rid)
+            return None
+        finally:
+            # Close the session if we created it
+            if not session_provided:
+                session.close()
+                debug_id(f"Closed database session for ImagePositionAssociation.associate_image_position", rid)
+
+    @classmethod
+    @with_request_id
+    def dissociate_image_position(cls,
+                                  image_id: int,
+                                  position_id: int,
+                                  request_id: Optional[str] = None,
+                                  session: Optional[Session] = None) -> bool:
+        """
+        Remove an association between an image and a position.
+
+        Args:
+            image_id: ID of the image to dissociate
+            position_id: ID of the position to dissociate
+            request_id: Optional request ID for tracking this operation in logs
+            session: Optional SQLAlchemy session. If None, a new session will be created
+
+        Returns:
+            True if the association was removed, False otherwise
+        """
+        # Get or use the provided request_id
+        rid = request_id or get_request_id()
+
+        # Get a database session if one wasn't provided
+        db_config = DatabaseConfig()
+        session_provided = session is not None
+        if not session_provided:
+            session = db_config.get_main_session()
+            debug_id(f"Created new database session for ImagePositionAssociation.dissociate_image_position", rid)
+
+        # Log the operation with request ID
+        debug_id(
+            f"Starting ImagePositionAssociation.dissociate_image_position with parameters: image_id={image_id}, position_id={position_id}",
+            rid)
+
+        try:
+            # Use the timed operation context manager with request ID
+            with log_timed_operation("ImagePositionAssociation.dissociate_image_position", rid):
+                # Find the association
+                association = session.query(cls).filter(
+                    cls.image_id == image_id,
+                    cls.position_id == position_id
+                ).first()
+
+                if not association:
+                    debug_id(f"No association found between image {image_id} and position {position_id}", rid)
+                    return False
+
+                # Delete the association
+                session.delete(association)
+
+                # Commit if we created the session
+                if not session_provided:
+                    session.commit()
+                    debug_id(f"Removed association between image {image_id} and position {position_id}", rid)
+
+                return True
+
+        except Exception as e:
+            error_id(f"Error in ImagePositionAssociation.dissociate_image_position: {str(e)}", rid, exc_info=True)
+            if not session_provided:
+                session.rollback()
+                debug_id(f"Rolled back transaction in ImagePositionAssociation.dissociate_image_position", rid)
+            return False
+        finally:
+            # Close the session if we created it
+            if not session_provided:
+                session.close()
+                debug_id(f"Closed database session for ImagePositionAssociation.dissociate_image_position", rid)
+
+    @classmethod
+    @with_request_id
+    def get_positions_by_image(cls,
+                               image_id: Optional[int] = None,
+                               title: Optional[str] = None,
+                               description: Optional[str] = None,
+                               file_path: Optional[str] = None,
+                               position_id: Optional[int] = None,
+                               area_id: Optional[int] = None,
+                               equipment_group_id: Optional[int] = None,
+                               model_id: Optional[int] = None,
+                               asset_number_id: Optional[int] = None,
+                               location_id: Optional[int] = None,
+                               subassembly_id: Optional[int] = None,
+                               component_assembly_id: Optional[int] = None,
+                               assembly_view_id: Optional[int] = None,
+                               site_location_id: Optional[int] = None,
+                               exact_match: bool = False,
+                               limit: int = 100,
+                               request_id: Optional[str] = None,
+                               session: Optional[Session] = None) -> List['Position']:
+        """
+        Get positions associated with images based on flexible search criteria.
+
+        Args:
+            image_id: Optional image ID to filter by
+            title: Optional image title to filter by
+            description: Optional image description to filter by
+            file_path: Optional file path to filter by
+            position_id: Optional position ID to filter by
+            area_id: Optional area ID to filter by
+            equipment_group_id: Optional equipment group ID to filter by
+            model_id: Optional model ID to filter by
+            asset_number_id: Optional asset number ID to filter by
+            location_id: Optional location ID to filter by
+            subassembly_id: Optional subassembly ID to filter by
+            component_assembly_id: Optional component assembly ID to filter by
+            assembly_view_id: Optional assembly view ID to filter by
+            site_location_id: Optional site location ID to filter by
+            exact_match: If True, performs exact matching instead of partial matching for string fields
+            limit: Maximum number of results to return (default 100)
+            request_id: Optional request ID for tracking this operation in logs
+            session: Optional SQLAlchemy session. If None, a new session will be created
+
+        Returns:
+            List of Position objects matching the search criteria
+        """
+        # Get or use the provided request_id
+        rid = request_id or get_request_id()
+
+        # Get a database session if one wasn't provided
+        db_config = DatabaseConfig()
+        session_provided = session is not None
+        if not session_provided:
+            session = db_config.get_main_session()
+            debug_id(f"Created new database session for ImagePositionAssociation.get_positions_by_image", rid)
+
+        # Log the search operation with request ID
+        search_params = {
+            'image_id': image_id,
+            'title': title,
+            'description': description,
+            'file_path': file_path,
+            'position_id': position_id,
+            'area_id': area_id,
+            'equipment_group_id': equipment_group_id,
+            'model_id': model_id,
+            'asset_number_id': asset_number_id,
+            'location_id': location_id,
+            'subassembly_id': subassembly_id,
+            'component_assembly_id': component_assembly_id,
+            'assembly_view_id': assembly_view_id,
+            'site_location_id': site_location_id,
+            'exact_match': exact_match,
+            'limit': limit
+        }
+        # Filter out None values for cleaner logging
+        logged_params = {k: v for k, v in search_params.items() if v is not None}
+        debug_id(f"Starting ImagePositionAssociation.get_positions_by_image with parameters: {logged_params}", rid)
+
+        try:
+            # Use the timed operation context manager with request ID
+            with log_timed_operation("ImagePositionAssociation.get_positions_by_image", rid):
+
+                # Start with a query that joins Position and ImagePositionAssociation
+                query = session.query(Position).join(cls, Position.id == cls.position_id).join(Image,
+                                                                                               Image.id == cls.image_id)
+
+                # Apply image filters
+                if image_id is not None:
+                    query = query.filter(Image.id == image_id)
+
+                if title is not None:
+                    if exact_match:
+                        query = query.filter(Image.title == title)
+                    else:
+                        query = query.filter(Image.title.ilike(f"%{title}%"))
+
+                if description is not None:
+                    if exact_match:
+                        query = query.filter(Image.description == description)
+                    else:
+                        query = query.filter(Image.description.ilike(f"%{description}%"))
+
+                if file_path is not None:
+                    if exact_match:
+                        query = query.filter(Image.file_path == file_path)
+                    else:
+                        query = query.filter(Image.file_path.ilike(f"%{file_path}%"))
+
+                # Apply position filters
+                if position_id is not None:
+                    query = query.filter(Position.id == position_id)
+
+                if area_id is not None:
+                    query = query.filter(Position.area_id == area_id)
+
+                if equipment_group_id is not None:
+                    query = query.filter(Position.equipment_group_id == equipment_group_id)
+
+                if model_id is not None:
+                    query = query.filter(Position.model_id == model_id)
+
+                if asset_number_id is not None:
+                    query = query.filter(Position.asset_number_id == asset_number_id)
+
+                if location_id is not None:
+                    query = query.filter(Position.location_id == location_id)
+
+                if subassembly_id is not None:
+                    query = query.filter(Position.subassembly_id == subassembly_id)
+
+                if component_assembly_id is not None:
+                    query = query.filter(Position.component_assembly_id == component_assembly_id)
+
+                if assembly_view_id is not None:
+                    query = query.filter(Position.assembly_view_id == assembly_view_id)
+
+                if site_location_id is not None:
+                    query = query.filter(Position.site_location_id == site_location_id)
+
+                # Make results distinct to avoid duplicates
+                query = query.distinct()
+
+                # Apply limit
+                query = query.limit(limit)
+
+                # Execute query and log results
+                results = query.all()
+                debug_id(f"ImagePositionAssociation.get_positions_by_image completed, found {len(results)} positions",
+                         rid)
+                return results
+
+        except Exception as e:
+            error_id(f"Error in ImagePositionAssociation.get_positions_by_image: {str(e)}", rid, exc_info=True)
+            return []
+        finally:
+            # Close the session if we created it
+            if not session_provided:
+                session.close()
+                debug_id(f"Closed database session for ImagePositionAssociation.get_positions_by_image", rid)
+
+    @classmethod
+    @with_request_id
+    def get_images_by_position(cls,
+                               position_id: Optional[int] = None,
+                               area_id: Optional[int] = None,
+                               equipment_group_id: Optional[int] = None,
+                               model_id: Optional[int] = None,
+                               asset_number_id: Optional[int] = None,
+                               location_id: Optional[int] = None,
+                               subassembly_id: Optional[int] = None,
+                               component_assembly_id: Optional[int] = None,
+                               assembly_view_id: Optional[int] = None,
+                               site_location_id: Optional[int] = None,
+                               image_id: Optional[int] = None,
+                               title: Optional[str] = None,
+                               description: Optional[str] = None,
+                               file_path: Optional[str] = None,
+                               exact_match: bool = False,
+                               limit: int = 100,
+                               request_id: Optional[str] = None,
+                               session: Optional[Session] = None) -> List['Image']:
+        """
+        Get images associated with positions based on flexible search criteria.
+
+        Args:
+            position_id: Optional position ID to filter by
+            area_id: Optional area ID to filter by
+            equipment_group_id: Optional equipment group ID to filter by
+            model_id: Optional model ID to filter by
+            asset_number_id: Optional asset number ID to filter by
+            location_id: Optional location ID to filter by
+            subassembly_id: Optional subassembly ID to filter by
+            component_assembly_id: Optional component assembly ID to filter by
+            assembly_view_id: Optional assembly view ID to filter by
+            site_location_id: Optional site location ID to filter by
+            image_id: Optional image ID to filter by
+            title: Optional image title to filter by
+            description: Optional image description to filter by
+            file_path: Optional file path to filter by
+            exact_match: If True, performs exact matching instead of partial matching for string fields
+            limit: Maximum number of results to return (default 100)
+            request_id: Optional request ID for tracking this operation in logs
+            session: Optional SQLAlchemy session. If None, a new session will be created
+
+        Returns:
+            List of Image objects matching the search criteria
+        """
+        # Get or use the provided request_id
+        rid = request_id or get_request_id()
+
+        # Get a database session if one wasn't provided
+        db_config = DatabaseConfig()
+        session_provided = session is not None
+        if not session_provided:
+            session = db_config.get_main_session()
+            debug_id(f"Created new database session for ImagePositionAssociation.get_images_by_position", rid)
+
+        # Log the search operation with request ID
+        search_params = {
+            'position_id': position_id,
+            'area_id': area_id,
+            'equipment_group_id': equipment_group_id,
+            'model_id': model_id,
+            'asset_number_id': asset_number_id,
+            'location_id': location_id,
+            'subassembly_id': subassembly_id,
+            'component_assembly_id': component_assembly_id,
+            'assembly_view_id': assembly_view_id,
+            'site_location_id': site_location_id,
+            'image_id': image_id,
+            'title': title,
+            'description': description,
+            'file_path': file_path,
+            'exact_match': exact_match,
+            'limit': limit
+        }
+        # Filter out None values for cleaner logging
+        logged_params = {k: v for k, v in search_params.items() if v is not None}
+        debug_id(f"Starting ImagePositionAssociation.get_images_by_position with parameters: {logged_params}", rid)
+
+        try:
+            # Use the timed operation context manager with request ID
+            with log_timed_operation("ImagePositionAssociation.get_images_by_position", rid):
+
+                # Start with a query that joins Image and ImagePositionAssociation
+                query = session.query(Image).join(cls, Image.id == cls.image_id).join(Position,
+                                                                                      Position.id == cls.position_id)
+
+                # Apply position filters
+                if position_id is not None:
+                    query = query.filter(Position.id == position_id)
+
+                if area_id is not None:
+                    query = query.filter(Position.area_id == area_id)
+
+                if equipment_group_id is not None:
+                    query = query.filter(Position.equipment_group_id == equipment_group_id)
+
+                if model_id is not None:
+                    query = query.filter(Position.model_id == model_id)
+
+                if asset_number_id is not None:
+                    query = query.filter(Position.asset_number_id == asset_number_id)
+
+                if location_id is not None:
+                    query = query.filter(Position.location_id == location_id)
+
+                if subassembly_id is not None:
+                    query = query.filter(Position.subassembly_id == subassembly_id)
+
+                if component_assembly_id is not None:
+                    query = query.filter(Position.component_assembly_id == component_assembly_id)
+
+                if assembly_view_id is not None:
+                    query = query.filter(Position.assembly_view_id == assembly_view_id)
+
+                if site_location_id is not None:
+                    query = query.filter(Position.site_location_id == site_location_id)
+
+                # Apply image filters
+                if image_id is not None:
+                    query = query.filter(Image.id == image_id)
+
+                if title is not None:
+                    if exact_match:
+                        query = query.filter(Image.title == title)
+                    else:
+                        query = query.filter(Image.title.ilike(f"%{title}%"))
+
+                if description is not None:
+                    if exact_match:
+                        query = query.filter(Image.description == description)
+                    else:
+                        query = query.filter(Image.description.ilike(f"%{description}%"))
+
+                if file_path is not None:
+                    if exact_match:
+                        query = query.filter(Image.file_path == file_path)
+                    else:
+                        query = query.filter(Image.file_path.ilike(f"%{file_path}%"))
+
+                # Make results distinct to avoid duplicates
+                query = query.distinct()
+
+                # Apply limit
+                query = query.limit(limit)
+
+                # Execute query and log results
+                results = query.all()
+                debug_id(f"ImagePositionAssociation.get_images_by_position completed, found {len(results)} images", rid)
+                return results
+
+        except Exception as e:
+            error_id(f"Error in ImagePositionAssociation.get_images_by_position: {str(e)}", rid, exc_info=True)
+            return []
+        finally:
+            # Close the session if we created it
+            if not session_provided:
+                session.close()
+                debug_id(f"Closed database session for ImagePositionAssociation.get_images_by_position", rid)
+
+class DrawingPositionAssociation(Base):
+    __tablename__ = 'drawing_position'
+    id = Column(Integer, primary_key=True)
+    drawing_id = Column(Integer, ForeignKey('drawing.id'), nullable=False)
+    position_id = Column(Integer, ForeignKey('position.id'), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('drawing_id', 'position_id', name='uq_drawing_position'),
+        Index('ix_drawing_position_drawing_id', 'drawing_id'),
+        Index('ix_drawing_position_position_id', 'position_id'),
+    )
+
+    drawing = relationship("Drawing", back_populates="drawing_position")
+    position = relationship("Position", back_populates="drawing_position")
+
+    @classmethod
+    @with_request_id
+    def associate_drawing_position(cls,
+                                   drawing_id: int,
+                                   position_id: int,
+                                   request_id: Optional[str] = None,
+                                   session: Optional[Session] = None) -> Optional['DrawingPositionAssociation']:
+        """
+        Associate a drawing with a position.
+
+        Args:
+            drawing_id: ID of the drawing to associate
+            position_id: ID of the position to associate
+            request_id: Optional request ID for tracking this operation in logs
+            session: Optional SQLAlchemy session. If None, a new session will be created
+
+        Returns:
+            The created DrawingPositionAssociation object if successful, None otherwise
+        """
+        # Get or use the provided request_id
+        rid = request_id or get_request_id()
+
+        # Get a database session if one wasn't provided
+        db_config = DatabaseConfig()
+        session_provided = session is not None
+        if not session_provided:
+            session = db_config.get_main_session()
+            debug_id(f"Created new database session for DrawingPositionAssociation.associate_drawing_position", rid)
+
+        # Log the operation with request ID
+        debug_id(
+            f"Starting DrawingPositionAssociation.associate_drawing_position with parameters: drawing_id={drawing_id}, position_id={position_id}",
+            rid)
+
+        try:
+            # Use the timed operation context manager with request ID
+            with log_timed_operation("DrawingPositionAssociation.associate_drawing_position", rid):
+
+                # Check if drawing exists
+                drawing = session.query(Drawing).filter(Drawing.id == drawing_id).first()
+                if not drawing:
+                    error_id(
+                        f"Error in DrawingPositionAssociation.associate_drawing_position: Drawing with ID {drawing_id} not found",
+                        rid)
+                    return None
+
+                # Check if position exists
+                position = session.query(Position).filter(Position.id == position_id).first()
+                if not position:
+                    error_id(
+                        f"Error in DrawingPositionAssociation.associate_drawing_position: Position with ID {position_id} not found",
+                        rid)
+                    return None
+
+                # Check if association already exists
+                existing = session.query(cls).filter(
+                    cls.drawing_id == drawing_id,
+                    cls.position_id == position_id
+                ).first()
+
+                if existing:
+                    debug_id(f"Association between drawing {drawing_id} and position {position_id} already exists", rid)
+                    return existing
+
+                # Create new association
+                association = cls(drawing_id=drawing_id, position_id=position_id)
+                session.add(association)
+
+                # Commit if we created the session
+                if not session_provided:
+                    session.commit()
+                    debug_id(f"Committed new association between drawing {drawing_id} and position {position_id}", rid)
+
+                return association
+
+        except Exception as e:
+            error_id(f"Error in DrawingPositionAssociation.associate_drawing_position: {str(e)}", rid, exc_info=True)
+            if not session_provided:
+                session.rollback()
+                debug_id(f"Rolled back transaction in DrawingPositionAssociation.associate_drawing_position", rid)
+            return None
+        finally:
+            # Close the session if we created it
+            if not session_provided:
+                session.close()
+                debug_id(f"Closed database session for DrawingPositionAssociation.associate_drawing_position", rid)
+
+    @classmethod
+    @with_request_id
+    def dissociate_drawing_position(cls,
+                                    drawing_id: int,
+                                    position_id: int,
+                                    request_id: Optional[str] = None,
+                                    session: Optional[Session] = None) -> bool:
+        """
+        Remove an association between a drawing and a position.
+
+        Args:
+            drawing_id: ID of the drawing to dissociate
+            position_id: ID of the position to dissociate
+            request_id: Optional request ID for tracking this operation in logs
+            session: Optional SQLAlchemy session. If None, a new session will be created
+
+        Returns:
+            True if the association was removed, False otherwise
+        """
+        # Get or use the provided request_id
+        rid = request_id or get_request_id()
+
+        # Get a database session if one wasn't provided
+        db_config = DatabaseConfig()
+        session_provided = session is not None
+        if not session_provided:
+            session = db_config.get_main_session()
+            debug_id(f"Created new database session for DrawingPositionAssociation.dissociate_drawing_position", rid)
+
+        # Log the operation with request ID
+        debug_id(
+            f"Starting DrawingPositionAssociation.dissociate_drawing_position with parameters: drawing_id={drawing_id}, position_id={position_id}",
+            rid)
+
+        try:
+            # Use the timed operation context manager with request ID
+            with log_timed_operation("DrawingPositionAssociation.dissociate_drawing_position", rid):
+                # Find the association
+                association = session.query(cls).filter(
+                    cls.drawing_id == drawing_id,
+                    cls.position_id == position_id
+                ).first()
+
+                if not association:
+                    debug_id(f"No association found between drawing {drawing_id} and position {position_id}", rid)
+                    return False
+
+                # Delete the association
+                session.delete(association)
+
+                # Commit if we created the session
+                if not session_provided:
+                    session.commit()
+                    debug_id(f"Removed association between drawing {drawing_id} and position {position_id}", rid)
+
+                return True
+
+        except Exception as e:
+            error_id(f"Error in DrawingPositionAssociation.dissociate_drawing_position: {str(e)}", rid, exc_info=True)
+            if not session_provided:
+                session.rollback()
+                debug_id(f"Rolled back transaction in DrawingPositionAssociation.dissociate_drawing_position", rid)
+            return False
+        finally:
+            # Close the session if we created it
+            if not session_provided:
+                session.close()
+                debug_id(f"Closed database session for DrawingPositionAssociation.dissociate_drawing_position", rid)
+
+    @classmethod
+    @with_request_id
+    def get_positions_by_drawing(cls,
+                                 drawing_id: Optional[int] = None,
+                                 drw_equipment_name: Optional[str] = None,
+                                 drw_number: Optional[str] = None,
+                                 drw_name: Optional[str] = None,
+                                 drw_revision: Optional[str] = None,
+                                 drw_spare_part_number: Optional[str] = None,
+                                 file_path: Optional[str] = None,
+                                 position_id: Optional[int] = None,
+                                 area_id: Optional[int] = None,
+                                 equipment_group_id: Optional[int] = None,
+                                 model_id: Optional[int] = None,
+                                 asset_number_id: Optional[int] = None,
+                                 location_id: Optional[int] = None,
+                                 subassembly_id: Optional[int] = None,
+                                 component_assembly_id: Optional[int] = None,
+                                 assembly_view_id: Optional[int] = None,
+                                 site_location_id: Optional[int] = None,
+                                 exact_match: bool = False,
+                                 limit: int = 100,
+                                 request_id: Optional[str] = None,
+                                 session: Optional[Session] = None) -> List['Position']:
+        """
+        Get positions associated with drawings based on flexible search criteria.
+
+        Args:
+            drawing_id: Optional drawing ID to filter by
+            drw_equipment_name: Optional equipment name to filter by
+            drw_number: Optional drawing number to filter by
+            drw_name: Optional drawing name to filter by
+            drw_revision: Optional revision to filter by
+            drw_spare_part_number: Optional spare part number to filter by
+            file_path: Optional file path to filter by
+            position_id: Optional position ID to filter by
+            area_id: Optional area ID to filter by
+            equipment_group_id: Optional equipment group ID to filter by
+            model_id: Optional model ID to filter by
+            asset_number_id: Optional asset number ID to filter by
+            location_id: Optional location ID to filter by
+            subassembly_id: Optional subassembly ID to filter by
+            component_assembly_id: Optional component assembly ID to filter by
+            assembly_view_id: Optional assembly view ID to filter by
+            site_location_id: Optional site location ID to filter by
+            exact_match: If True, performs exact matching instead of partial matching for string fields
+            limit: Maximum number of results to return (default 100)
+            request_id: Optional request ID for tracking this operation in logs
+            session: Optional SQLAlchemy session. If None, a new session will be created
+
+        Returns:
+            List of Position objects matching the search criteria
+        """
+        # Get or use the provided request_id
+        rid = request_id or get_request_id()
+
+        # Get a database session if one wasn't provided
+        db_config = DatabaseConfig()
+        session_provided = session is not None
+        if not session_provided:
+            session = db_config.get_main_session()
+            debug_id(f"Created new database session for DrawingPositionAssociation.get_positions_by_drawing", rid)
+
+        # Log the search operation with request ID
+        search_params = {
+            'drawing_id': drawing_id,
+            'drw_equipment_name': drw_equipment_name,
+            'drw_number': drw_number,
+            'drw_name': drw_name,
+            'drw_revision': drw_revision,
+            'drw_spare_part_number': drw_spare_part_number,
+            'file_path': file_path,
+            'position_id': position_id,
+            'area_id': area_id,
+            'equipment_group_id': equipment_group_id,
+            'model_id': model_id,
+            'asset_number_id': asset_number_id,
+            'location_id': location_id,
+            'subassembly_id': subassembly_id,
+            'component_assembly_id': component_assembly_id,
+            'assembly_view_id': assembly_view_id,
+            'site_location_id': site_location_id,
+            'exact_match': exact_match,
+            'limit': limit
+        }
+        # Filter out None values for cleaner logging
+        logged_params = {k: v for k, v in search_params.items() if v is not None}
+        debug_id(f"Starting DrawingPositionAssociation.get_positions_by_drawing with parameters: {logged_params}", rid)
+
+        try:
+            # Use the timed operation context manager with request ID
+            with log_timed_operation("DrawingPositionAssociation.get_positions_by_drawing", rid):
+
+                # Start with a query that joins Position and DrawingPositionAssociation
+                query = session.query(Position).join(cls, Position.id == cls.position_id).join(Drawing,
+                                                                                               Drawing.id == cls.drawing_id)
+
+                # Apply drawing filters
+                if drawing_id is not None:
+                    query = query.filter(Drawing.id == drawing_id)
+
+                if drw_equipment_name is not None:
+                    if exact_match:
+                        query = query.filter(Drawing.drw_equipment_name == drw_equipment_name)
+                    else:
+                        query = query.filter(Drawing.drw_equipment_name.ilike(f"%{drw_equipment_name}%"))
+
+                if drw_number is not None:
+                    if exact_match:
+                        query = query.filter(Drawing.drw_number == drw_number)
+                    else:
+                        query = query.filter(Drawing.drw_number.ilike(f"%{drw_number}%"))
+
+                if drw_name is not None:
+                    if exact_match:
+                        query = query.filter(Drawing.drw_name == drw_name)
+                    else:
+                        query = query.filter(Drawing.drw_name.ilike(f"%{drw_name}%"))
+
+                if drw_revision is not None:
+                    if exact_match:
+                        query = query.filter(Drawing.drw_revision == drw_revision)
+                    else:
+                        query = query.filter(Drawing.drw_revision.ilike(f"%{drw_revision}%"))
+
+                if drw_spare_part_number is not None:
+                    if exact_match:
+                        query = query.filter(Drawing.drw_spare_part_number == drw_spare_part_number)
+                    else:
+                        query = query.filter(Drawing.drw_spare_part_number.ilike(f"%{drw_spare_part_number}%"))
+
+                if file_path is not None:
+                    if exact_match:
+                        query = query.filter(Drawing.file_path == file_path)
+                    else:
+                        query = query.filter(Drawing.file_path.ilike(f"%{file_path}%"))
+
+                # Apply position filters
+                if position_id is not None:
+                    query = query.filter(Position.id == position_id)
+
+                if area_id is not None:
+                    query = query.filter(Position.area_id == area_id)
+
+                if equipment_group_id is not None:
+                    query = query.filter(Position.equipment_group_id == equipment_group_id)
+
+                if model_id is not None:
+                    query = query.filter(Position.model_id == model_id)
+
+                if asset_number_id is not None:
+                    query = query.filter(Position.asset_number_id == asset_number_id)
+
+                if location_id is not None:
+                    query = query.filter(Position.location_id == location_id)
+
+                if subassembly_id is not None:
+                    query = query.filter(Position.subassembly_id == subassembly_id)
+
+                if component_assembly_id is not None:
+                    query = query.filter(Position.component_assembly_id == component_assembly_id)
+
+                if assembly_view_id is not None:
+                    query = query.filter(Position.assembly_view_id == assembly_view_id)
+
+                if site_location_id is not None:
+                    query = query.filter(Position.site_location_id == site_location_id)
+
+                # Make results distinct to avoid duplicates
+                query = query.distinct()
+
+                # Apply limit
+                query = query.limit(limit)
+
+                # Execute query and log results
+                results = query.all()
+                debug_id(
+                    f"DrawingPositionAssociation.get_positions_by_drawing completed, found {len(results)} positions",
+                    rid)
+                return results
+
+        except Exception as e:
+            error_id(f"Error in DrawingPositionAssociation.get_positions_by_drawing: {str(e)}", rid, exc_info=True)
+            return []
+        finally:
+            # Close the session if we created it
+            if not session_provided:
+                session.close()
+                debug_id(f"Closed database session for DrawingPositionAssociation.get_positions_by_drawing", rid)
+
+    @classmethod
+    @with_request_id
+    def get_drawings_by_position(cls,
+                                 position_id: Optional[int] = None,
+                                 area_id: Optional[int] = None,
+                                 equipment_group_id: Optional[int] = None,
+                                 model_id: Optional[int] = None,
+                                 asset_number_id: Optional[int] = None,
+                                 location_id: Optional[int] = None,
+                                 subassembly_id: Optional[int] = None,
+                                 component_assembly_id: Optional[int] = None,
+                                 assembly_view_id: Optional[int] = None,
+                                 site_location_id: Optional[int] = None,
+                                 drawing_id: Optional[int] = None,
+                                 drw_equipment_name: Optional[str] = None,
+                                 drw_number: Optional[str] = None,
+                                 drw_name: Optional[str] = None,
+                                 drw_revision: Optional[str] = None,
+                                 drw_spare_part_number: Optional[str] = None,
+                                 file_path: Optional[str] = None,
+                                 exact_match: bool = False,
+                                 limit: int = 100,
+                                 request_id: Optional[str] = None,
+                                 session: Optional[Session] = None) -> List['Drawing']:
+        """
+        Get drawings associated with positions based on flexible search criteria.
+
+        Args:
+            position_id: Optional position ID to filter by
+            area_id: Optional area ID to filter by
+            equipment_group_id: Optional equipment group ID to filter by
+            model_id: Optional model ID to filter by
+            asset_number_id: Optional asset number ID to filter by
+            location_id: Optional location ID to filter by
+            subassembly_id: Optional subassembly ID to filter by
+            component_assembly_id: Optional component assembly ID to filter by
+            assembly_view_id: Optional assembly view ID to filter by
+            site_location_id: Optional site location ID to filter by
+            drawing_id: Optional drawing ID to filter by
+            drw_equipment_name: Optional equipment name to filter by
+            drw_number: Optional drawing number to filter by
+            drw_name: Optional drawing name to filter by
+            drw_revision: Optional revision to filter by
+            drw_spare_part_number: Optional spare part number to filter by
+            file_path: Optional file path to filter by
+            exact_match: If True, performs exact matching instead of partial matching for string fields
+            limit: Maximum number of results to return (default 100)
+            request_id: Optional request ID for tracking this operation in logs
+            session: Optional SQLAlchemy session. If None, a new session will be created
+
+        Returns:
+            List of Drawing objects matching the search criteria
+        """
+        # Get or use the provided request_id
+        rid = request_id or get_request_id()
+
+        # Get a database session if one wasn't provided
+        db_config = DatabaseConfig()
+        session_provided = session is not None
+        if not session_provided:
+            session = db_config.get_main_session()
+            debug_id(f"Created new database session for DrawingPositionAssociation.get_drawings_by_position", rid)
+
+        # Log the search operation with request ID
+        search_params = {
+            'position_id': position_id,
+            'area_id': area_id,
+            'equipment_group_id': equipment_group_id,
+            'model_id': model_id,
+            'asset_number_id': asset_number_id,
+            'location_id': location_id,
+            'subassembly_id': subassembly_id,
+            'component_assembly_id': component_assembly_id,
+            'assembly_view_id': assembly_view_id,
+            'site_location_id': site_location_id,
+            'drawing_id': drawing_id,
+            'drw_equipment_name': drw_equipment_name,
+            'drw_number': drw_number,
+            'drw_name': drw_name,
+            'drw_revision': drw_revision,
+            'drw_spare_part_number': drw_spare_part_number,
+            'file_path': file_path,
+            'exact_match': exact_match,
+            'limit': limit
+        }
+        # Filter out None values for cleaner logging
+        logged_params = {k: v for k, v in search_params.items() if v is not None}
+        debug_id(f"Starting DrawingPositionAssociation.get_drawings_by_position with parameters: {logged_params}", rid)
+
+        try:
+            # Use the timed operation context manager with request ID
+            with log_timed_operation("DrawingPositionAssociation.get_drawings_by_position", rid):
+
+                # Start with a query that joins Drawing and DrawingPositionAssociation
+                query = session.query(Drawing).join(cls, Drawing.id == cls.drawing_id).join(Position,
+                                                                                            Position.id == cls.position_id)
+
+                # Apply position filters
+                if position_id is not None:
+                    query = query.filter(Position.id == position_id)
+
+                if area_id is not None:
+                    query = query.filter(Position.area_id == area_id)
+
+                if equipment_group_id is not None:
+                    query = query.filter(Position.equipment_group_id == equipment_group_id)
+
+                if model_id is not None:
+                    query = query.filter(Position.model_id == model_id)
+
+                if asset_number_id is not None:
+                    query = query.filter(Position.asset_number_id == asset_number_id)
+
+                if location_id is not None:
+                    query = query.filter(Position.location_id == location_id)
+
+                if subassembly_id is not None:
+                    query = query.filter(Position.subassembly_id == subassembly_id)
+
+                if component_assembly_id is not None:
+                    query = query.filter(Position.component_assembly_id == component_assembly_id)
+
+                if assembly_view_id is not None:
+                    query = query.filter(Position.assembly_view_id == assembly_view_id)
+
+                if site_location_id is not None:
+                    query = query.filter(Position.site_location_id == site_location_id)
+
+                # Apply drawing filters
+                if drawing_id is not None:
+                    query = query.filter(Drawing.id == drawing_id)
+
+                if drw_equipment_name is not None:
+                    if exact_match:
+                        query = query.filter(Drawing.drw_equipment_name == drw_equipment_name)
+                    else:
+                        query = query.filter(Drawing.drw_equipment_name.ilike(f"%{drw_equipment_name}%"))
+
+                if drw_number is not None:
+                    if exact_match:
+                        query = query.filter(Drawing.drw_number == drw_number)
+                    else:
+                        query = query.filter(Drawing.drw_number.ilike(f"%{drw_number}%"))
+
+                if drw_name is not None:
+                    if exact_match:
+                        query = query.filter(Drawing.drw_name == drw_name)
+                    else:
+                        query = query.filter(Drawing.drw_name.ilike(f"%{drw_name}%"))
+
+                if drw_revision is not None:
+                    if exact_match:
+                        query = query.filter(Drawing.drw_revision == drw_revision)
+                    else:
+                        query = query.filter(Drawing.drw_revision.ilike(f"%{drw_revision}%"))
+
+                if drw_spare_part_number is not None:
+                    if exact_match:
+                        query = query.filter(Drawing.drw_spare_part_number == drw_spare_part_number)
+                    else:
+                        query = query.filter(Drawing.drw_spare_part_number.ilike(f"%{drw_spare_part_number}%"))
+
+                if file_path is not None:
+                    if exact_match:
+                        query = query.filter(Drawing.file_path == file_path)
+                    else:
+                        query = query.filter(Drawing.file_path.ilike(f"%{file_path}%"))
+
+                # Make results distinct to avoid duplicates
+                query = query.distinct()
+
+                # Apply limit
+                query = query.limit(limit)
+
+                # Execute query and log results
+                results = query.all()
+                debug_id(
+                    f"DrawingPositionAssociation.get_drawings_by_position completed, found {len(results)} drawings",
+                    rid)
+                return results
+
+        except Exception as e:
+            error_id(f"Error in DrawingPositionAssociation.get_drawings_by_position: {str(e)}", rid, exc_info=True)
+            return []
+        finally:
+            # Close the session if we created it
+            if not session_provided:
+                session.close()
+                debug_id(f"Closed database session for DrawingPositionAssociation.get_drawings_by_position", rid)
+
+class PartsPositionImageAssociation(Base):
+    __tablename__ = 'part_position_image'
+    id = Column(Integer, primary_key=True)
+    part_id = Column(Integer, ForeignKey('part.id'), nullable=False)
+    position_id = Column(Integer, ForeignKey('position.id'), nullable=False)
+    image_id = Column(Integer, ForeignKey('image.id'), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('part_id', 'position_id', 'image_id', name='uq_part_position_image'),
+        Index('ix_ppi_part_id', 'part_id'),
+        Index('ix_ppi_position_id', 'position_id'),
+        Index('ix_ppi_image_id', 'image_id'),
+    )
+    image = relationship("Image", back_populates="parts_position_image")
+    position = relationship("Position", back_populates="part_position_image")
+
+    @classmethod
+    @with_request_id
+    def search(cls, session=None, **filters):
+        """
+        Search the 'part_position_image' table based on the provided filters.
+
+        Args:
+            session: SQLAlchemy session (optional).
+            filters: A dictionary of filter parameters (e.g., part_id, position_id, image_id).
+
+        Returns:
+            List of matching 'PartPositionImageAssociation' objects.
+        """
+        if session is None:
+            session = DatabaseConfig().get_main_session()
+
+        # Get the request ID for logging
+        request_id = get_request_id()
+
+        # Log the start of the search operation
+        info_id(f"Starting search with filters: {filters}", request_id=request_id)
+
+        # Start with the base query
+        query = session.query(cls)
+
+        try:
+            # Apply filters dynamically
+            if filters:
+                for field, value in filters.items():
+                    if value is not None:  # Only apply non-None filters
+                        query = query.filter(getattr(cls, field) == value)
+
+            # Execute the query and log the result
+            results = query.all()
+
+            # Log the number of results found
+            info_id(f"Search returned {len(results)} result(s) for filters: {filters}", request_id=request_id)
+
+            return results
+        except SQLAlchemyError as e:
+            # Log the error
+            error_id(f"Error during search operation with filters {filters}: {e}", request_id=request_id, exc_info=True)
+            raise
+
+    @classmethod
+    @with_request_id
+    def get_corresponding_position_ids(cls, session, area_id=None, equipment_group_id=None, model_id=None,
+                                       asset_number_id=None, location_id=None):
+        """
+        Search for corresponding Position IDs based on the provided filters.
+        Traverses the hierarchy and retrieves matching Position IDs.
+
+        Args:
+            session: SQLAlchemy session
+            area_id: ID of the area (optional)
+            equipment_group_id: ID of the equipment group (optional)
+            model_id: ID of the model (optional)
+            asset_number_id: ID of the asset number (optional)
+            location_id: ID of the location (optional)
+
+        Returns:
+            List of Position IDs that match the criteria
+        """
+        # Get the request ID for logging
+        request_id = get_request_id()
+
+        # Log the start of the operation
+        info_id(f"Starting get_corresponding_position_ids with filters: "
+                f"area_id={area_id}, equipment_group_id={equipment_group_id}, "
+                f"model_id={model_id}, asset_number_id={asset_number_id}, "
+                f"location_id={location_id}", request_id=request_id)
+
+        # Start by fetching the root-level positions based on area_id (or first level in hierarchy)
+        try:
+            positions = cls._get_positions_by_hierarchy(session, area_id=area_id,
+                                                        equipment_group_id=equipment_group_id,
+                                                        model_id=model_id,
+                                                        asset_number_id=asset_number_id,
+                                                        location_id=location_id)
+            position_ids = [position.id for position in positions]
+
+            # Log the number of Position IDs found
+            info_id(f"Found {len(position_ids)} Position IDs for the given filters", request_id=request_id)
+
+            return position_ids
+        except SQLAlchemyError as e:
+            error_id(f"Error during get_corresponding_position_ids with filters "
+                     f"area_id={area_id}, equipment_group_id={equipment_group_id}, "
+                     f"model_id={model_id}, asset_number_id={asset_number_id}, "
+                     f"location_id={location_id}: {e}", request_id=request_id, exc_info=True)
+            raise
+
+    @classmethod
+    @with_request_id
+    def _get_positions_by_hierarchy(cls, session, area_id=None, equipment_group_id=None, model_id=None,
+                                    asset_number_id=None, location_id=None):
+        """
+        Helper method to fetch positions based on hierarchical filters.
+
+        Args:
+            session: SQLAlchemy session
+            area_id, equipment_group_id, model_id, asset_number_id, location_id: IDs for filtering
+
+        Returns:
+            List of Position objects that match the criteria
+        """
+        # Get the request ID for logging
+        request_id = get_request_id()
+
+        # Building the filter dynamically based on input parameters
+        filters = {}
+        if area_id:
+            filters['area_id'] = area_id
+        if equipment_group_id:
+            filters['equipment_group_id'] = equipment_group_id
+        if model_id:
+            filters['model_id'] = model_id
+        if asset_number_id:
+            filters['asset_number_id'] = asset_number_id
+        if location_id:
+            filters['location_id'] = location_id
+
+        try:
+            # Log the filter being applied
+            info_id(f"Applying filters to query: {filters}", request_id=request_id)
+
+            # Query the Position table based on the filters
+            query = session.query(Position).filter_by(**filters)
+
+            # Execute and return the results
+            positions = query.all()
+
+            # Log the number of results
+            info_id(f"Found {len(positions)} positions for the given filters", request_id=request_id)
+
+            return positions
+        except SQLAlchemyError as e:
+            error_id(f"Error during _get_positions_by_hierarchy with filters {filters}: {e}", request_id=request_id,
+                     exc_info=True)
+            raise
 
 
+class Image(Base):
+    __tablename__ = 'image'
+
+    id = Column(Integer, primary_key=True)
+    title = Column(String, nullable=False)
+    description = Column(String, nullable=True)  # Made nullable for simplicity
+    file_path = Column(String, nullable=False)
+    img_metadata = Column(JSON, nullable=True)
+
+    # Keep only the essential relationships that exist in your current schema
+    image_position_association = relationship("ImagePositionAssociation", back_populates="image")
+    parts_position_image = relationship("PartsPositionImageAssociation", back_populates="image")
+
+    @classmethod
+    @with_request_id
+    def add_simple_image(cls, session: Session, title: str, file_path: str,
+                         description: str = None, position_id: int = None,
+                         request_id: str = None):
+        """
+        Simple method to add an image to the database without file copying.
+        Stores the file_path as provided (could be relative or absolute).
+        """
+        try:
+            image = cls(
+                title=title.strip(),
+                description=description.strip() if description else None,
+                file_path=file_path,
+                img_metadata={}
+            )
+
+            session.add(image)
+            session.flush()  # Get the ID without committing
+
+            # Optionally link to a position
+            if position_id is not None:
+                # Check if ImagePositionAssociation exists first
+                existing_assoc = session.query(ImagePositionAssociation).filter(
+                    ImagePositionAssociation.image_id == image.id,
+                    ImagePositionAssociation.position_id == position_id
+                ).first()
+
+                if not existing_assoc:
+                    assoc = ImagePositionAssociation(
+                        image_id=image.id,
+                        position_id=position_id
+                    )
+                    session.add(assoc)
+
+            session.commit()
+            logger.info(f"Added image: {title} with ID {image.id}")
+            return image
+
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Failed to add image {title}: {e}")
+            return None
+
+    @classmethod
+    @with_request_id
+    def get_by_id(cls, session: Session, image_id: int, request_id: str = None):
+        """Get an image by ID"""
+        return session.query(cls).filter(cls.id == image_id).first()
+
+    @classmethod
+    @with_request_id
+    def search_images(cls, session: Session, title: str = None, description: str = None,
+                      limit: int = 50, request_id: str = None):
+        """Search images by title or description"""
+        query = session.query(cls)
+
+        if title:
+            query = query.filter(cls.title.ilike(f"%{title}%"))
+        if description:
+            query = query.filter(cls.description.ilike(f"%{description}%"))
+
+        return query.limit(limit).all()
+
+    @classmethod
+    @with_request_id
+    def delete_image(cls, session: Session, image_id: int, request_id: str = None):
+        """Delete an image and its associations"""
+        try:
+            image = session.query(cls).filter(cls.id == image_id).first()
+            if not image:
+                return False
+
+            # Delete the image (cascading will handle associations)
+            session.delete(image)
+            session.commit()
+            logger.info(f"Deleted image ID {image_id}")
+            return True
+
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Failed to delete image {image_id}: {e}")
+            return False
