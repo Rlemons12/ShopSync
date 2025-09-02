@@ -27,16 +27,71 @@ from app.modules.configuration.log_config import (
 
 DatabaseConfig = ShopSyncDatabase
 
-# Web framework dependency removed; request_id is provided via @with_request_id
-# Main Tables
-class SiteLocation(Base):
-    __tablename__ = 'site_location'
-    id = Column(Integer, primary_key=True)
-    title = Column(String, nullable=False)
-    room_number = Column(String, nullable=False)
-    site_area = Column(String, nullable=False)
+# -----------------------------
+# Main Tables (drop-in fixed)
+# -----------------------------
 
+class BuildingComplex(Base):
+    """Defines the building complex (campus/site) that contains buildings."""
+    __tablename__ = 'buildingComplex'   # keep legacy name to avoid migrations
+
+    id          = Column(Integer, primary_key=True)
+    name        = Column(String)
+    description = Column(String)
+    address     = Column(String)
+
+    # One complex -> many buildings
+    buildings = relationship(
+        "Building",
+        back_populates="building_complex",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    def __repr__(self):
+        return f"<BuildingComplex id={self.id} name={self.name!r}>"
+
+
+class Building(Base):
+    """A building that belongs to a complex."""
+    __tablename__ = 'building'
+
+    id                  = Column(Integer, primary_key=True)
+    name                = Column(String)
+    description         = Column(String)
+    address             = Column(String)
+    # FK targets legacy 'buildingComplex' table above
+    id_building_complex = Column(Integer, ForeignKey('buildingComplex.id', ondelete="CASCADE"))
+
+    # Many buildings -> one complex
+    building_complex = relationship("BuildingComplex", back_populates="buildings")
+
+    # One building -> many site locations (rooms/areas)
+    site_locations = relationship(
+        "SiteLocation",
+        back_populates="building",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    def __repr__(self):
+        return f"<Building id={self.id} name={self.name!r} complex_id={self.id_building_complex}>"
+
+
+class SiteLocation(Base):
+    """A specific location/room/area inside a building."""
+    __tablename__ = 'site_location'
+
+    id          = Column(Integer, primary_key=True)
+    title       = Column(String, nullable=False)
+    room_number = Column(String, nullable=False)
+    site_area   = Column(String, nullable=False)
+    building_id = Column(Integer, ForeignKey('building.id', ondelete="CASCADE"))  # keep nullable if you need
+
+    # Relationships
     position = relationship('Position', back_populates="site_location")
+    building = relationship('Building', back_populates='site_locations')
+
 
     @classmethod
     @with_request_id
@@ -3531,6 +3586,7 @@ class Image(Base):
     # Keep only the essential relationships that exist in your current schema
     image_position_association = relationship("ImagePositionAssociation", back_populates="image")
     parts_position_image = relationship("PartsPositionImageAssociation", back_populates="image")
+    tool_image_association = relationship("ToolImageAssociation", back_populates="image")
 
     @classmethod
     @with_request_id
