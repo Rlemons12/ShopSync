@@ -53,125 +53,6 @@ class DatabaseWorker(QThread):
             self.error_occurred.emit(str(e))
 
 
-class HierarchyTreeWidget(QTreeWidget):
-    """Tree widget for displaying equipment hierarchy"""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setHeaderLabels(['Name', 'Type', 'ID', 'Description'])
-        self.setRootIsDecorated(True)
-        self.setAlternatingRowColors(True)
-        self.itemClicked.connect(self.on_item_clicked)
-        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.customContextMenuRequested.connect(self.show_context_menu)
-
-    def populate_hierarchy(self, db_manager):
-        """Populate tree with database hierarchy"""
-        request_id = set_request_id()
-        debug_id("Populating equipment hierarchy", request_id)
-        self.clear()
-
-        try:
-            with db_manager.session_scope() as session:
-                areas = session.query(Area).all()
-
-                for area in areas:
-                    area_item = QTreeWidgetItem([
-                        area.name, 'Area', str(area.id), area.description or ''
-                    ])
-                    area_item.setData(0, Qt.ItemDataRole.UserRole, {'type': 'area', 'data': area})
-                    self.addTopLevelItem(area_item)
-
-                    # Load equipment groups
-                    for eq_group in area.equipment_group:
-                        eq_item = QTreeWidgetItem([
-                            eq_group.name, 'Equipment Group', str(eq_group.id),
-                            eq_group.description or ''
-                        ])
-                        eq_item.setData(0, Qt.ItemDataRole.UserRole,
-                                        {'type': 'equipment_group', 'data': eq_group})
-                        area_item.addChild(eq_item)
-
-                        # Load models
-                        for model in eq_group.model:
-                            model_item = QTreeWidgetItem([
-                                model.name, 'Model', str(model.id),
-                                model.description or ''
-                            ])
-                            model_item.setData(0, Qt.ItemDataRole.UserRole,
-                                               {'type': 'model', 'data': model})
-                            eq_item.addChild(model_item)
-
-                            # Load asset numbers
-                            for asset in model.asset_number:
-                                asset_item = QTreeWidgetItem([
-                                    asset.number, 'Asset', str(asset.id),
-                                    asset.description or ''
-                                ])
-                                asset_item.setData(0, Qt.ItemDataRole.UserRole,
-                                                   {'type': 'asset', 'data': asset})
-                                model_item.addChild(asset_item)
-
-                            # Load locations
-                            for location in model.location:
-                                location_item = QTreeWidgetItem([
-                                    location.name, 'Location', str(location.id),
-                                    location.description or ''
-                                ])
-                                location_item.setData(0, Qt.ItemDataRole.UserRole,
-                                                      {'type': 'location', 'data': location})
-                                model_item.addChild(location_item)
-
-            info_id(f"Successfully populated hierarchy with {len(areas)} areas", request_id)
-
-        except Exception as e:
-            error_id(f"Failed to populate hierarchy: {str(e)}", request_id)
-            QMessageBox.critical(self, "Database Error", f"Failed to load hierarchy: {str(e)}")
-
-    def on_item_clicked(self, item, column):
-        """Handle item click"""
-        data = item.data(0, Qt.ItemDataRole.UserRole)
-        if data and hasattr(self.parent(), 'show_entity_details'):
-            self.parent().show_entity_details(data['type'], data['data'])
-
-    def show_context_menu(self, position):
-        """Show context menu for tree items"""
-        item = self.itemAt(position)
-        if not item:
-            return
-
-        menu = QMenu()
-
-        edit_action = menu.addAction("Edit")
-        delete_action = menu.addAction("Delete")
-        menu.addSeparator()
-        add_child_action = menu.addAction("Add Child")
-
-        action = menu.exec(self.mapToGlobal(position))
-
-        if action == edit_action:
-            self.on_item_clicked(item, 0)
-        elif action == delete_action:
-            self.delete_item(item)
-        elif action == add_child_action:
-            self.add_child_item(item)
-
-    def delete_item(self, item):
-        """Delete selected item"""
-        reply = QMessageBox.question(self, "Confirm Delete",
-                                     "Are you sure you want to delete this item?")
-        if reply == QMessageBox.StandardButton.Yes:
-            # Implement deletion logic here
-            request_id = set_request_id()
-            info_id("Item deletion requested", request_id)
-
-    def add_child_item(self, item):
-        """Add child item to selected item"""
-        # Implement add child logic here
-        request_id = set_request_id()
-        info_id("Add child item requested", request_id)
-
-
 class EntityDetailsWidget(QWidget):
     """Widget for displaying and editing entity details"""
 
@@ -567,11 +448,11 @@ class NewEntityDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    """Main application window"""
+    """Main application window (no Equipment Hierarchy panel)"""
 
     def __init__(self):
         super().__init__()
-        self.db_manager = None  # Database manager will be initialized
+        self.db_manager = None
         self.setup_ui()
         self.setup_database()
 
@@ -579,121 +460,100 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("ShopSync - Equipment Management System")
         self.setGeometry(100, 100, 1400, 900)
 
-        # Create central widget
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
+        # Central widget
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
 
-        # Create main layout
-        main_layout = QHBoxLayout(central_widget)
-
-        # Create splitter
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(splitter)
-
-        # Left panel - Hierarchy tree
-        self.tree_widget = HierarchyTreeWidget(self)
-        tree_frame = QFrame()
-        tree_layout = QVBoxLayout(tree_frame)
-        tree_layout.addWidget(QLabel("Equipment Hierarchy"))
-        tree_layout.addWidget(self.tree_widget)
-        splitter.addWidget(tree_frame)
-
-        # Right panel - Tabs
+        # Full-width tabs (no splitter / no tree)
         self.tab_widget = QTabWidget()
-        splitter.addWidget(self.tab_widget)
+        main_layout.addWidget(self.tab_widget, 1)
 
-        # Details tab
-        self.details_widget = EntityDetailsWidget(self)
-        self.tab_widget.addTab(self.details_widget, "Details")
+        # Remote Inventory tab (room → container → shelf → drawer → slot)
+        # NOTE: Ensure RemoteInventoryWidget class is defined above.
+        self.remote_inventory = RemoteInventoryWidget(self)
+        self.tab_widget.addTab(self.remote_inventory, "Remote Inventory")
 
         # Search tab
         self.search_widget = SearchWidget(self)
         self.tab_widget.addTab(self.search_widget, "Search")
 
+        # Details tab
+        self.details_widget = EntityDetailsWidget(self)
+        self.tab_widget.addTab(self.details_widget, "Details")
+
         # Inventory tab
         self.inventory_widget = InventoryWidget(self)
         self.tab_widget.addTab(self.inventory_widget, "Inventory")
 
-        # Set splitter proportions
-        splitter.setSizes([400, 1000])
 
-        # Create menu bar
+
+        # Menus / toolbar / status bar
         self.create_menu_bar()
-
-        # Create toolbar
         self.create_toolbar()
-
-        # Create status bar
         self.statusBar().showMessage("Ready")
 
     def create_menu_bar(self):
-        """Create application menu bar"""
         menubar = self.menuBar()
 
         # File menu
         file_menu = menubar.addMenu("File")
-
         new_action = QAction("New Entity", self)
         new_action.triggered.connect(self.new_entity)
         file_menu.addAction(new_action)
-
         file_menu.addSeparator()
-
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
         # View menu
         view_menu = menubar.addMenu("View")
-
         refresh_action = QAction("Refresh", self)
         refresh_action.triggered.connect(self.refresh_data)
         view_menu.addAction(refresh_action)
 
         # Tools menu
         tools_menu = menubar.addMenu("Tools")
-
         import_action = QAction("Import Data", self)
         import_action.triggered.connect(self.import_data)
         tools_menu.addAction(import_action)
-
         export_action = QAction("Export Data", self)
         export_action.triggered.connect(self.export_data)
         tools_menu.addAction(export_action)
 
     def create_toolbar(self):
-        """Create application toolbar"""
         toolbar = self.addToolBar("Main")
-
         new_action = QAction("New", self)
         new_action.triggered.connect(self.new_entity)
         toolbar.addAction(new_action)
-
         toolbar.addSeparator()
-
         refresh_action = QAction("Refresh", self)
         refresh_action.triggered.connect(self.refresh_data)
         toolbar.addAction(refresh_action)
 
     def setup_database(self):
-        """Initialize database connection"""
+        """Initialize database connection (no hierarchy population)"""
         request_id = set_request_id()
         try:
             info_id("Initializing database connection", request_id)
 
-            # Initialize the database manager
+            # Initialize DB manager
             self.db_manager = ShopSyncDatabase(echo=False)
 
-            # Create tables if they don't exist
+            # Create tables if needed
             self.db_manager.create_all()
 
-            # Populate the hierarchy tree
-            self.tree_widget.populate_hierarchy(self.db_manager)
+            # Hand DB manager to tabs that use it
+            if hasattr(self, "remote_inventory"):
+                self.remote_inventory.set_db_manager(self.db_manager)
 
-            # Check database status
+            # Optional: if your InventoryWidget needs DB, call its setup here
+            # (currently placeholder methods in your code)
+            # self.inventory_widget.set_db_manager(self.db_manager)
+
+            # Inspect DB
             tables, counts = self.db_manager.inspect()
             info_id(f"Database connected with {len(tables)} tables", request_id)
-
             self.statusBar().showMessage(f"Database connected - {len(tables)} tables found")
 
         except Exception as e:
@@ -703,12 +563,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Database connection failed")
 
     def show_entity_details(self, entity_type, entity_data):
-        """Show entity details in the details tab"""
-        self.tab_widget.setCurrentIndex(0)  # Switch to details tab
+        """Still available (e.g., open from Search results)."""
+        self.tab_widget.setCurrentIndex(0)
         self.details_widget.show_entity_details(entity_type, entity_data)
 
     def new_entity(self):
-        """Open new entity dialog"""
         request_id = set_request_id()
         debug_id("Opening new entity dialog", request_id)
         dialog = NewEntityDialog(self)
@@ -717,38 +576,337 @@ class MainWindow(QMainWindow):
             self.refresh_data()
 
     def refresh_data(self):
-        """Refresh all data displays"""
+        """Refresh tabs (no hierarchy to refresh)."""
         request_id = set_request_id()
         info_id("Refreshing all data displays", request_id)
-
         if self.db_manager:
-            self.tree_widget.populate_hierarchy(self.db_manager)
             self.inventory_widget.refresh_inventory()
-
+            self.remote_inventory.refresh_all()
         self.statusBar().showMessage("Data refreshed")
 
     def import_data(self):
-        """Import data functionality"""
         request_id = set_request_id()
         debug_id("Import data requested", request_id)
         QMessageBox.information(self, "Import", "Import functionality will be implemented")
 
     def export_data(self):
-        """Export data functionality"""
         request_id = set_request_id()
         debug_id("Export data requested", request_id)
         QMessageBox.information(self, "Export", "Export functionality will be implemented")
 
     def closeEvent(self, event):
-        """Handle application close"""
         request_id = set_request_id()
         info_id("Application closing", request_id)
-
         if self.db_manager:
-            # The database manager uses context managers, so no explicit cleanup needed
             debug_id("Database manager cleaned up", request_id)
-
         event.accept()
+
+
+class RemoteInventoryWidget(QWidget):
+    """
+    Remote inventory workflow:
+    Room (SiteLocation) -> Container -> Shelf -> Drawer -> Slot
+    Shows contents at every step.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.db_manager = None
+        self._has_drawer_slot = 'DrawerSlot' in globals()
+
+        self._build_ui()
+        self._wire_signals()
+
+    def set_db_manager(self, db_manager):
+        self.db_manager = db_manager
+        self.refresh_all()
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+
+        # Top: search for room
+        search_row = QHBoxLayout()
+        self.room_search = QLineEdit()
+        self.room_search.setPlaceholderText("Search room (title / room number / area)…")
+        self.room_btn = QPushButton("Search")
+        search_row.addWidget(QLabel("Room:"))
+        search_row.addWidget(self.room_search, 1)
+        search_row.addWidget(self.room_btn)
+        outer.addLayout(search_row)
+
+        # Dependent picks
+        form = QFormLayout()
+        self.room_combo     = QComboBox()
+        self.container_combo= QComboBox()
+        self.shelf_combo    = QComboBox()
+        self.drawer_combo   = QComboBox()
+        self.slot_combo     = QComboBox()
+        form.addRow("Select Room:", self.room_combo)
+        form.addRow("Container:", self.container_combo)
+        form.addRow("Shelf:", self.shelf_combo)
+        form.addRow("Drawer:", self.drawer_combo)
+        if self._has_drawer_slot:
+            form.addRow("Slot:", self.slot_combo)
+        outer.addLayout(form)
+
+        # Contents table
+        self.contents = QTableWidget()
+        self.contents.setColumnCount(6)
+        self.contents.setHorizontalHeaderLabels(
+            ["Level", "ID", "Name/Number", "Type", "Qty / Unit", "Notes"]
+        )
+        self.contents.horizontalHeader().setStretchLastSection(True)
+        outer.addWidget(QLabel("Contents"))
+        outer.addWidget(self.contents, 1)
+
+        # Footer actions
+        foot = QHBoxLayout()
+        self.refresh_btn = QPushButton("Refresh")
+        self.clear_btn   = QPushButton("Clear Selections")
+        foot.addWidget(self.refresh_btn)
+        foot.addWidget(self.clear_btn)
+        foot.addStretch()
+        outer.addLayout(foot)
+
+    def _wire_signals(self):
+        self.room_btn.clicked.connect(self.search_rooms)
+        self.refresh_btn.clicked.connect(self.refresh_all)
+        self.clear_btn.clicked.connect(self.clear_all)
+
+        self.room_combo.currentIndexChanged.connect(self._on_room_changed)
+        self.container_combo.currentIndexChanged.connect(self._on_container_changed)
+        self.shelf_combo.currentIndexChanged.connect(self._on_shelf_changed)
+        self.drawer_combo.currentIndexChanged.connect(self._on_drawer_changed)
+        if self._has_drawer_slot:
+            self.slot_combo.currentIndexChanged.connect(self._on_slot_changed)
+
+    # ---------- Data loaders ----------
+    def refresh_all(self):
+        if not self.db_manager:
+            return
+        self._load_rooms()
+        self._load_containers()
+        self._load_shelves()
+        self._load_drawers()
+        if self._has_drawer_slot:
+            self._load_slots()
+        self._refresh_contents()
+
+    def clear_all(self):
+        self.room_search.clear()
+        self.room_combo.clear()
+        self.container_combo.clear()
+        self.shelf_combo.clear()
+        self.drawer_combo.clear()
+        if self._has_drawer_slot:
+            self.slot_combo.clear()
+        self.contents.setRowCount(0)
+
+    def search_rooms(self):
+        """Filter SiteLocations by title / room_number / site_area"""
+        if not self.db_manager:
+            return
+        text = self.room_search.text().strip()
+        request_id = set_request_id()
+        debug_id(f"[RemoteInventory] room search: {text!r}", request_id)
+        self.room_combo.clear()
+
+        with self.db_manager.session_scope() as s:
+            q = s.query(SiteLocation)
+            if text:
+                like = f"%{text}%"
+                q = q.filter(
+                    (SiteLocation.title.ilike(like)) |
+                    (SiteLocation.room_number.ilike(like)) |
+                    (SiteLocation.site_area.ilike(like))
+                )
+            q = q.order_by(SiteLocation.title.asc(), SiteLocation.room_number.asc())
+            rooms = q.all()
+
+        for r in rooms:
+            self.room_combo.addItem(f"{r.title} (Room {r.room_number}, {r.site_area})", r.id)
+        info_id(f"[RemoteInventory] loaded {len(rooms)} rooms", request_id)
+
+    def _load_rooms(self):
+        """Initial load of some rooms (no filter)"""
+        if self.room_combo.count() > 0:
+            return
+        with self.db_manager.session_scope() as s:
+            rooms = s.query(SiteLocation).order_by(SiteLocation.title.asc()).limit(100).all()
+        for r in rooms:
+            self.room_combo.addItem(f"{r.title} (Room {r.room_number}, {r.site_area})", r.id)
+
+    def _load_containers(self):
+        self.container_combo.clear()
+        room_id = self._current_id(self.room_combo)
+        if not room_id:
+            return
+        with self.db_manager.session_scope() as s:
+            containers = s.query(Container).filter(Container.position.has(site_location_id=room_id)).order_by(Container.name.asc()).all()
+        for c in containers:
+            self.container_combo.addItem(getattr(c, "name", f"Container {c.id}"), c.id)
+
+    def _load_shelves(self):
+        self.shelf_combo.clear()
+        cont_id = self._current_id(self.container_combo)
+        if not cont_id:
+            return
+        with self.db_manager.session_scope() as s:
+            shelves = s.query(Shelf).filter(Shelf.container_id == cont_id).order_by(Shelf.id.asc()).all()
+        for sh in shelves:
+            self.shelf_combo.addItem(getattr(sh, "label", f"Shelf {sh.id}"), sh.id)
+
+    def _load_drawers(self):
+        self.drawer_combo.clear()
+        shelf_id = self._current_id(self.shelf_combo)
+        if not shelf_id:
+            return
+        with self.db_manager.session_scope() as s:
+            drawers = s.query(Drawer).filter(Drawer.shelf_id == shelf_id).order_by(Drawer.id.asc()).all()
+        for dr in drawers:
+            self.drawer_combo.addItem(getattr(dr, "label", f"Drawer {dr.id}"), dr.id)
+
+    def _load_slots(self):
+        self.slot_combo.clear()
+        if not self._has_drawer_slot:
+            return
+        drawer_id = self._current_id(self.drawer_combo)
+        if not drawer_id:
+            return
+        DrawerSlot = globals().get("DrawerSlot")  # optional
+        if not DrawerSlot:
+            return
+        with self.db_manager.session_scope() as s:
+            slots = s.query(DrawerSlot).filter(DrawerSlot.drawer_id == drawer_id).order_by(DrawerSlot.id.asc()).all()
+        for sl in slots:
+            label = getattr(sl, "slot_label", None) or f"R{getattr(sl, 'row_index', '-')}-C{getattr(sl, 'col_index', '-')}"
+            self.slot_combo.addItem(label, sl.id)
+
+    # ---------- Change handlers ----------
+    def _on_room_changed(self, idx):
+        self._load_containers()
+        self._load_shelves()
+        self._load_drawers()
+        if self._has_drawer_slot:
+            self._load_slots()
+        self._refresh_contents()
+
+    def _on_container_changed(self, idx):
+        self._load_shelves()
+        self._load_drawers()
+        if self._has_drawer_slot:
+            self._load_slots()
+        self._refresh_contents()
+
+    def _on_shelf_changed(self, idx):
+        self._load_drawers()
+        if self._has_drawer_slot:
+            self._load_slots()
+        self._refresh_contents()
+
+    def _on_drawer_changed(self, idx):
+        if self._has_drawer_slot:
+            self._load_slots()
+        self._refresh_contents()
+
+    def _on_slot_changed(self, idx):
+        self._refresh_contents()
+
+    # ---------- Contents ----------
+    def _refresh_contents(self):
+        """
+        Show what's contained at the most specific selected level.
+        Priority: Slot > Drawer > Shelf > Container > Room
+        """
+        request_id = set_request_id()
+        self.contents.setRowCount(0)
+
+        level = None
+        rows = []
+
+        with self.db_manager.session_scope() as s:
+            # try slot
+            if self._has_drawer_slot and (slot_id := self._current_id(self.slot_combo)):
+                level = "Slot"
+                rows = self._fetch_contents_for_slot(s, slot_id)
+            elif (drawer_id := self._current_id(self.drawer_combo)):
+                level = "Drawer"
+                rows = self._fetch_contents_for_drawer(s, drawer_id)
+            elif (shelf_id := self._current_id(self.shelf_combo)):
+                level = "Shelf"
+                rows = self._fetch_contents_for_shelf(s, shelf_id)
+            elif (container_id := self._current_id(self.container_combo)):
+                level = "Container"
+                rows = self._fetch_contents_for_container(s, container_id)
+            elif (room_id := self._current_id(self.room_combo)):
+                level = "Room"
+                rows = self._fetch_contents_for_room(s, room_id)
+
+        # Render
+        for r in rows:
+            self._append_row(level, *r)
+
+        info_id(f"[RemoteInventory] contents refreshed: level={level}, rows={len(rows)}", request_id)
+
+    # ---------- Queries for each level ----------
+    def _fetch_contents_for_room(self, s, room_id):
+        # all containers in room + their immediate children counts (fast summary)
+        containers = s.query(Container).filter(Container.position.has(site_location_id=room_id)).all()
+        out = []
+        for c in containers:
+            out.append((c.id, getattr(c, "name", f"Container {c.id}"), "Container", "", ""))
+        return out
+
+    def _fetch_contents_for_container(self, s, cont_id):
+        shelves = s.query(Shelf).filter(Shelf.container_id == cont_id).all()
+        return [(sh.id, getattr(sh, "label", f"Shelf {sh.id}"), "Shelf", "", "") for sh in shelves]
+
+    def _fetch_contents_for_shelf(self, s, shelf_id):
+        drawers = s.query(Drawer).filter(Drawer.shelf_id == shelf_id).all()
+        return [(dr.id, getattr(dr, "label", f"Drawer {dr.id}"), "Drawer", "", "") for dr in drawers]
+
+    def _fetch_contents_for_drawer(self, s, drawer_id):
+        # show either slots (if any) or parts in this drawer
+        rows = []
+        DrawerSlot = globals().get("DrawerSlot")
+        if DrawerSlot:
+            slots = s.query(DrawerSlot).filter(DrawerSlot.drawer_id == drawer_id).all()
+            if slots:
+                for sl in slots:
+                    label = getattr(sl, "slot_label", None) or f"R{getattr(sl, 'row_index','-')}-C{getattr(sl, 'col_index','-')}"
+                    rows.append((sl.id, label, "Slot", "", ""))
+                return rows
+        # Fallback: parts directly associated with drawer (if your schema supports it)
+        inv = s.query(Inventory).filter(Inventory.drawer_id == drawer_id).all()
+        for i in inv:
+            part_name = getattr(i.part, "name", f"Part {i.part_id}") if getattr(i, "part", None) else f"Part {i.part_id}"
+            qty_unit  = f"{getattr(i,'quantity', '')} {getattr(i,'unit','')}".strip()
+            rows.append((i.part_id, part_name, "Part", qty_unit, getattr(i, "note", "")))
+        return rows
+
+    def _fetch_contents_for_slot(self, s, slot_id):
+        inv = s.query(Inventory).filter(Inventory.drawer_slot_id == slot_id).all()
+        rows = []
+        for i in inv:
+            part_name = getattr(i.part, "name", f"Part {i.part_id}") if getattr(i, "part", None) else f"Part {i.part_id}"
+            qty_unit  = f"{getattr(i,'quantity','')} {getattr(i,'unit','')}".strip()
+            rows.append((i.part_id, part_name, "Part", qty_unit, getattr(i, "note", "")))
+        return rows
+
+    # ---------- Helpers ----------
+    def _current_id(self, combo):
+        idx = combo.currentIndex()
+        return combo.itemData(idx) if idx >= 0 else None
+
+    def _append_row(self, level, id_, name, typ, qty, notes):
+        r = self.contents.rowCount()
+        self.contents.insertRow(r)
+        self.contents.setItem(r, 0, QTableWidgetItem(level or ""))
+        self.contents.setItem(r, 1, QTableWidgetItem(str(id_)))
+        self.contents.setItem(r, 2, QTableWidgetItem(name or ""))
+        self.contents.setItem(r, 3, QTableWidgetItem(typ or ""))
+        self.contents.setItem(r, 4, QTableWidgetItem(qty or ""))
+        self.contents.setItem(r, 5, QTableWidgetItem(notes or ""))
 
 
 def main():
