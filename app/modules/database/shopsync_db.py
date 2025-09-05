@@ -1,4 +1,5 @@
 # Standard library
+from io import StringIO
 from typing import Optional, List
 from sqlalchemy import Column
 from sqlalchemy.types import JSON
@@ -31,14 +32,16 @@ DatabaseConfig = ShopSyncDatabase
 # Main Tables (drop-in fixed)
 # -----------------------------
 
-class BuildingComplex(Base):
+class Campus(Base):
     """Defines the building complex (campus/site) that contains buildings."""
-    __tablename__ = 'buildingComplex'   # keep legacy name to avoid migrations
+    __tablename__ = 'campus'  # keep legacy name to avoid migrations
 
     id          = Column(Integer, primary_key=True)
-    name        = Column(String)
-    description = Column(String)
-    address     = Column(String)
+    name        = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    city        = Column(String, nullable=True)
+    state       = Column(String, nullable=True)
+    country     = Column(String, nullable=True)
 
     # One complex -> many buildings
     buildings = relationship(
@@ -51,20 +54,21 @@ class BuildingComplex(Base):
     def __repr__(self):
         return f"<BuildingComplex id={self.id} name={self.name!r}>"
 
-
 class Building(Base):
     """A building that belongs to a complex."""
     __tablename__ = 'building'
 
     id                  = Column(Integer, primary_key=True)
-    name                = Column(String)
-    description         = Column(String)
-    address             = Column(String)
+    name                = Column(String, nullable=False)
+    description         = Column(String, nullable=True)
+    address             = Column(String, nullable=True)
+
+
     # FK targets legacy 'buildingComplex' table above
-    id_building_complex = Column(Integer, ForeignKey('buildingComplex.id', ondelete="CASCADE"))
+    id_building_complex = Column(Integer, ForeignKey('buildingComplex.id', ondelete="CASCADE"), nullable=False)
 
     # Many buildings -> one complex
-    building_complex = relationship("BuildingComplex", back_populates="buildings")
+    campus = relationship("Campus", back_populates="buildings")
 
     # One building -> many site locations (rooms/areas)
     site_locations = relationship(
@@ -76,7 +80,6 @@ class Building(Base):
 
     def __repr__(self):
         return f"<Building id={self.id} name={self.name!r} complex_id={self.id_building_complex}>"
-
 
 class SiteLocation(Base):
     """A specific location/room/area inside a building."""
@@ -230,6 +233,8 @@ class Position(Base):
     component_assembly_id = Column(Integer, ForeignKey('component_assembly.id'), nullable=True)
     assembly_view_id = Column(Integer, ForeignKey('assembly_view.id'), nullable=True)
     site_location_id = Column(Integer, ForeignKey('site_location.id'), nullable=True)
+    building_id = Column(Integer, ForeignKey('building.id'), nullable=True)
+    campus_id = Column(Integer, ForeignKey('campus.id'), nullable=True)
 
     area = relationship("Area", back_populates="position")
     equipment_group = relationship("EquipmentGroup", back_populates="position")
@@ -242,6 +247,8 @@ class Position(Base):
     drawing_position = relationship("DrawingPositionAssociation", back_populates="position")
     #problem_position = relationship("ProblemPositionAssociation", back_populates="position")
     #completed_document_position_association = relationship("CompletedDocumentPositionAssociation", back_populates="position")
+    building = relationship("Building", back_populates="position")
+    campus = relationship("Campus", back_populates="position")
     site_location = relationship("SiteLocation", back_populates="position")
     #position_tasks = relationship("TaskPositionAssociation", back_populates="position", cascade="all, delete-orphan")
     tool_position_association = relationship("ToolPositionAssociation", back_populates="position")
