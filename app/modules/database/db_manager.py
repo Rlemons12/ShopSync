@@ -97,3 +97,7 @@ class ShopSyncDatabase:
     def __exit__(self, exc_type, exc, tb):
         self.dispose()
         return False
+
+    def print_inspect(self):
+        # Delegate to DatabaseConfig's implementation
+        self._db.print_inspect()

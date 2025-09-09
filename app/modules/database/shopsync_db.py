@@ -1966,17 +1966,24 @@ class DrawerSlot(Base):
             return None
         return {"drawer_slot": obj, "downward": {}}
 
+
 class Part(Base):
     __tablename__ = "part"
 
-    id          = Column(Integer, primary_key=True)
-    sku         = Column(String, nullable=False, unique=True)   # natural key
-    name        = Column(String, nullable=False)
-    description = Column(String, nullable=True)
-    manufacturer = Column(String, nullable=True)
-    unit_of_measure = Column(String, nullable=True)  # e.g., "ea", "box", "ft"
+    id            = Column(Integer, primary_key=True)
 
-    # Link to stock records; no problem/task relationships here
+    # MP2/SPC-style fields
+    part_number   = Column(String, nullable=False, unique=True, index=True)  # ITEMNUM
+    name          = Column(String, nullable=False)                           # DESCRIPTION
+    oem_mfg       = Column(String, nullable=True)                            # OEMMFG (Manufacturer)
+    model         = Column(String, nullable=True)                            # MODEL (MFG Part Number)
+    class_flag    = Column(String, nullable=True)                            # Class Flag (Category)
+    ud6           = Column(String, nullable=True)                            # UD6
+    type          = Column(String, nullable=True)                            # TYPE
+    notes         = Column(String, nullable=True)                            # Notes (Long Description)
+    documentation = Column(String, nullable=True)                            # Specifications
+
+    # Link to stock records
     inventories = relationship(
         "Inventory",
         back_populates="part",
@@ -1985,38 +1992,57 @@ class Part(Base):
     )
 
     __table_args__ = (
-        Index("ix_part_name", "name"),
+        Index("ix_part_name", "name"),  # keep name index for quick lookups
     )
 
     # ------------- helpers -------------
     @staticmethod
-    def _norm(sku: str, name: str) -> tuple[str, str]:
-        s = (sku or "").strip()
-        n = (name or "").strip()
-        if not s or not n:
-            raise ValueError("sku and name are required.")
-        return s, n
+    def _norm(part_number: str, name: str) -> tuple[str, str]:
+        pn = (part_number or "").strip()
+        nm = (name or "").strip()
+        if not pn or not nm:
+            raise ValueError("part_number and name are required.")
+        return pn, nm
 
     # ------------- API -------------
     @classmethod
     @with_request_id
-    def find_or_create(cls, session: Session, *, sku: str, name: str, description: Optional[str]=None,
-                       manufacturer: Optional[str]=None, unit_of_measure: Optional[str]=None, request_id=None) -> "Part":
-        sku, name = cls._norm(sku, name)
-        existing = session.execute(select(cls).where(cls.sku == sku)).scalar_one_or_none()
+    def find_or_create(
+        cls,
+        session: Session,
+        *,
+        part_number: str,
+        name: str,
+        oem_mfg: Optional[str] = None,
+        model: Optional[str] = None,
+        class_flag: Optional[str] = None,
+        ud6: Optional[str] = None,
+        type: Optional[str] = None,
+        notes: Optional[str] = None,
+        documentation: Optional[str] = None,
+        request_id=None,
+    ) -> "Part":
+        part_number, name = cls._norm(part_number, name)
+        existing = session.execute(select(cls).where(cls.part_number == part_number)).scalar_one_or_none()
         if existing:
-            logger.info(f"Found Part sku={sku}", extra={'request_id': request_id} if request_id else None)
+            logger.info(f"Found Part part_number={part_number}", extra={'request_id': request_id} if request_id else None)
             return existing
+
         obj = cls(
-            sku=sku, name=name,
-            description=(description or "").strip() or None,
-            manufacturer=(manufacturer or "").strip() or None,
-            unit_of_measure=(unit_of_measure or "").strip() or None,
+            part_number=part_number,
+            name=name,
+            oem_mfg=(oem_mfg or "").strip() or None,
+            model=(model or "").strip() or None,
+            class_flag=(class_flag or "").strip() or None,
+            ud6=(ud6 or "").strip() or None,
+            type=(type or "").strip() or None,
+            notes=(notes or "").strip() or None,
+            documentation=(documentation or "").strip() or None,
         )
         session.add(obj)
         try:
             session.commit()
-            logger.info(f"Created Part sku={sku}", extra={'request_id': request_id} if request_id else None)
+            logger.info(f"Created Part part_number={part_number}", extra={'request_id': request_id} if request_id else None)
             return obj
         except SQLAlchemyError:
             session.rollback()
@@ -2024,34 +2050,25 @@ class Part(Base):
             raise
 
     @classmethod
-    @with_request_id
-    def delete_part(cls, session: Session, part_id: int, request_id=None) -> bool:
-        obj = session.get(cls, part_id)
-        if not obj:
-            logger.warning(f"Part id={part_id} not found", extra={'request_id': request_id} if request_id else None)
-            return False
-        session.delete(obj)
-        try:
-            session.commit()
-            logger.info(f"Deleted Part id={part_id}", extra={'request_id': request_id} if request_id else None)
-            return True
-        except SQLAlchemyError:
-            session.rollback()
-            logger.exception("Failed to delete Part", extra={'request_id': request_id} if request_id else None)
-            raise
-
-    @classmethod
-    def search(cls, session: Session, q: str, limit: int = 50) -> list["Part"]:
+    def search(cls, session: Session, q: str, limit: int = 50) -> List["Part"]:
         if not q:
             return []
         like = f"%{q.strip()}%"
         stmt = (
             select(cls)
-            .where((cls.sku.ilike(like)) | (cls.name.ilike(like)))  # type: ignore[attr-defined]
-            .order_by(cls.sku.asc())
+            .where(
+                (cls.part_number.ilike(like)) |
+                (cls.name.ilike(like)) |
+                (cls.model.ilike(like)) |
+                (cls.oem_mfg.ilike(like))
+            )
+            .order_by(cls.part_number.asc())
             .limit(limit)
         )
         return list(session.execute(stmt).scalars())
+
+    def __repr__(self) -> str:
+        return f"<Part id={self.id} part_number={self.part_number!r} name={self.name!r}>"
 
 class Inventory(Base):
     """

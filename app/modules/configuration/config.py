@@ -25,7 +25,7 @@ DATABASE_URL = f"sqlite:///{DB_PATH}"
 EQUIPMENT_RELATIONSHIPS_XLSX = os.path.join(
     LOADSHEETS_DIR, "load_equipment_relationships_table_data.xlsx"
 )
-
+PARTS_LOADSHEET_XLSX = os.path.join(LOADSHEETS_DIR, "load_MP2_ITEMS_BOMS.xlsx")
 # Ensure directories exist
 for d in [DATABASE_DIR, LOADSHEETS_DIR, LOADER_DIR, LOGS_DIR, IMAGES_DIR]:
     os.makedirs(d, exist_ok=True)
