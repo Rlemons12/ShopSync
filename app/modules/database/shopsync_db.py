@@ -1655,14 +1655,13 @@ class Shelf(Base):
         try:
             session.commit()
             where = f"container={container_id}" if container_id else "no-container"
-            info_id(
-                "Created Shelf '%s' on position %s (%s)",
-                code, position_id, where, request_id=request_id
-            )
+            # NOTE: request_id passed positionally (last arg)
+            info_id("Created Shelf '%s' on position %s (%s)", code, position_id, where, request_id)
             return obj
         except SQLAlchemyError:
             session.rollback()
-            error_id("Failed to create Shelf", exc_info=True, request_id=request_id)
+            # positional request_id must come BEFORE any keyword args (e.g., exc_info)
+            error_id("Failed to create Shelf", request_id, exc_info=True)
             raise
 
     @classmethod
@@ -1670,16 +1669,16 @@ class Shelf(Base):
     def delete_shelf(cls, session: Session, shelf_id: int, request_id=None) -> bool:
         obj = session.get(cls, shelf_id)
         if not obj:
-            warning_id("Shelf %s not found", shelf_id, request_id=request_id)
+            warning_id("Shelf %s not found", shelf_id, request_id)
             return False
         session.delete(obj)
         try:
             session.commit()
-            info_id("Deleted Shelf %s", shelf_id, request_id=request_id)
+            info_id("Deleted Shelf %s", shelf_id, request_id)
             return True
         except SQLAlchemyError:
             session.rollback()
-            error_id("Failed to delete Shelf", exc_info=True, request_id=request_id)
+            error_id("Failed to delete Shelf", request_id, exc_info=True)
             raise
 
     @classmethod
@@ -1703,7 +1702,7 @@ class Shelf(Base):
             )
         ).scalar_one_or_none()
         if existing:
-            info_id("Found Shelf '%s' on position %s", code, position_id, request_id=request_id)
+            info_id("Found Shelf '%s' on position %s", code, position_id, request_id)
             return existing
         return cls.add_shelf(
             session,
@@ -1722,9 +1721,10 @@ class Shelf(Base):
             select(cls).options(joinedload(cls.drawers)).where(cls.id == shelf_id)
         ).scalar_one_or_none()
         if not obj:
-            warning_id("Shelf %s not found", shelf_id, request_id=request_id)
+            warning_id("Shelf %s not found", shelf_id, request_id)
             return None
         return {"shelf": obj, "downward": {"drawers": obj.drawers}}
+
 
 class Drawer(Base):
     __tablename__ = "drawer"

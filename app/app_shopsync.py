@@ -376,7 +376,13 @@ class InventoryWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.db_manager = None
         self.setup_ui()
+
+    # Allow MainWindow to hand us the DB
+    def set_db_manager(self, db_manager):
+        self.db_manager = db_manager
+        self.refresh_inventory()
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -385,10 +391,10 @@ class InventoryWidget(QWidget):
         controls_layout = QHBoxLayout()
 
         self.part_search = QLineEdit()
-        self.part_search.setPlaceholderText("Search parts...")
+        self.part_search.setPlaceholderText("Search parts…")
 
         self.location_combo = QComboBox()
-        # Populate from database
+        self.location_combo.setEnabled(False)  # not used in this iteration; location is chosen in the dialog
 
         self.refresh_btn = QPushButton("Refresh")
         self.add_stock_btn = QPushButton("Add Stock")
@@ -412,30 +418,314 @@ class InventoryWidget(QWidget):
             "Part SKU", "Part Name", "Location", "Quantity", "Unit", "Last Updated"
         ])
         self.inventory_table.horizontalHeader().setStretchLastSection(True)
+        self.inventory_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         layout.addWidget(self.inventory_table)
 
         # Connect signals
         self.refresh_btn.clicked.connect(self.refresh_inventory)
         self.add_stock_btn.clicked.connect(self.add_stock)
         self.transfer_btn.clicked.connect(self.transfer_stock)
+        self.part_search.returnPressed.connect(self.refresh_inventory)
 
     def refresh_inventory(self):
         """Refresh inventory display"""
         request_id = set_request_id()
         debug_id("Refreshing inventory display", request_id)
-        # Implement database query to load inventory
+        if not self.db_manager:
+            return
+
+        text = (self.part_search.text() or "").strip()
+        like = f"%{text}%"
+
+        # Load a flat list of inventory with the resolved human-readable location
+        with self.db_manager.session_scope() as s:
+            q = s.query(Inventory)
+            if text:
+                # join Part for filtering
+                q = q.join(Part).filter(
+                    (Part.part_number.ilike(like)) |
+                    (Part.name.ilike(like))
+                )
+            inv_rows = q.order_by(Inventory.id.desc()).limit(500).all()
+
+            # prefetch needed relations (avoid lazy round-trips)
+            # Part may not be configured with lazy='joined'; handle attributes defensively.
+            data = []
+            for i in inv_rows:
+                # Part fields
+                sku  = getattr(getattr(i, "part", None), "part_number", f"#{i.part_id}")
+                name = getattr(getattr(i, "part", None), "name", "")
+
+                # Resolve location string: Slot > Drawer > Shelf > Container > Room
+                loc_str = ""
+                if getattr(i, "drawer_slot_id", None):
+                    sl = getattr(i, "drawer_slot", None)
+                    dr = getattr(sl, "drawer", None) if sl else None
+                    sh = getattr(dr, "shelf", None) if dr else None
+                    co = getattr(sh, "container", None) if sh else None
+                    rm = getattr(getattr(co, "position", None), "site_location", None) if co else None
+                    slot_label = getattr(sl, "slot_label", None) or f"R{getattr(sl,'row_index','-')}-C{getattr(sl,'col_index','-')}" if sl else ""
+                    loc_str = f"{getattr(rm,'title','Room ?')} / {getattr(co,'name','Container ?')} / {getattr(sh,'label','Shelf ?')} / {getattr(dr,'label','Drawer ?')} / {slot_label}"
+                elif getattr(i, "drawer_id", None):
+                    dr = getattr(i, "drawer", None)
+                    sh = getattr(dr, "shelf", None) if dr else None
+                    co = getattr(sh, "container", None) if sh else None
+                    rm = getattr(getattr(co, "position", None), "site_location", None) if co else None
+                    loc_str = f"{getattr(rm,'title','Room ?')} / {getattr(co,'name','Container ?')} / {getattr(sh,'label','Shelf ?')} / {getattr(dr,'label','Drawer ?')}"
+                else:
+                    loc_str = "(unassigned)"
+
+                qty  = str(getattr(i, "quantity", "") or "")
+                unit = getattr(i, "unit", "") or ""
+                # If you keep a timestamp column, replace with that; otherwise show note
+                updated = getattr(i, "note", "") or ""
+
+                data.append((sku, name, loc_str, qty, unit, updated))
+
+        # Render table
+        self.inventory_table.setRowCount(0)
+        for sku, name, loc, qty, unit, updated in data:
+            r = self.inventory_table.rowCount()
+            self.inventory_table.insertRow(r)
+            self.inventory_table.setItem(r, 0, QTableWidgetItem(sku))
+            self.inventory_table.setItem(r, 1, QTableWidgetItem(name))
+            self.inventory_table.setItem(r, 2, QTableWidgetItem(loc))
+            self.inventory_table.setItem(r, 3, QTableWidgetItem(qty))
+            self.inventory_table.setItem(r, 4, QTableWidgetItem(unit))
+            self.inventory_table.setItem(r, 5, QTableWidgetItem(updated))
 
     def add_stock(self):
         """Add stock dialog"""
         request_id = set_request_id()
         debug_id("Opening add stock dialog", request_id)
-        # Implement add stock dialog
+        if not self.db_manager:
+            QMessageBox.warning(self, "Database", "Database not initialized.")
+            return
+
+        dlg = AddStockDialog(self, self.db_manager)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            # Refresh this tab and the Remote Inventory tab so new item appears
+            self.refresh_inventory()
+            mw = self.parent()
+            while mw and not isinstance(mw, QMainWindow):
+                mw = mw.parent()
+            if mw and hasattr(mw, "remote_inventory"):
+                mw.remote_inventory.refresh_all()
 
     def transfer_stock(self):
-        """Transfer stock dialog"""
+        """Transfer stock dialog (to be implemented similarly)"""
         request_id = set_request_id()
         debug_id("Opening transfer stock dialog", request_id)
-        # Implement transfer stock dialog
+        QMessageBox.information(self, "Transfer", "Transfer workflow not implemented yet.")
+
+
+class AddStockDialog(QDialog):
+    """
+    Dialog to add a Part into inventory at a specific location:
+    Room -> Container -> Shelf -> Drawer -> [Slot]
+    """
+    def __init__(self, parent, db_manager):
+        super().__init__(parent)
+        self.setWindowTitle("Add Stock")
+        self.db_manager = db_manager
+        self._has_drawer_slot = 'DrawerSlot' in globals()
+
+        self._build_ui()
+        self._wire_signals()
+        self._load_initial()
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        # --- Part row ---
+        part_row = QFormLayout()
+        self.part_search = QLineEdit()
+        self.part_search.setPlaceholderText("Search by SKU or name…")
+        self.part_combo  = QComboBox()  # filled by search
+        self.part_combo.setMinimumWidth(350)
+        self.btn_part_search = QPushButton("Search")
+        part_row.addRow("Search:", self.part_search)
+        part_row.addRow("Part:", self.part_combo)
+        part_row.addRow("", self.btn_part_search)
+        layout.addLayout(part_row)
+
+        # --- Location pickers ---
+        loc_grp = QGroupBox("Location")
+        loc_form = QFormLayout(loc_grp)
+        self.room_combo      = QComboBox()
+        self.container_combo = QComboBox()
+        self.shelf_combo     = QComboBox()
+        self.drawer_combo    = QComboBox()
+        self.slot_combo      = QComboBox()
+        loc_form.addRow("Room:", self.room_combo)
+        loc_form.addRow("Container:", self.container_combo)
+        loc_form.addRow("Shelf:", self.shelf_combo)
+        loc_form.addRow("Drawer:", self.drawer_combo)
+        if self._has_drawer_slot:
+            loc_form.addRow("Slot:", self.slot_combo)
+        layout.addWidget(loc_grp)
+
+        # --- Details ---
+        det_form = QFormLayout()
+        self.qty_edit  = QSpinBox()
+        self.qty_edit.setRange(0, 1_000_000)
+        self.unit_edit = QLineEdit()
+        self.note_edit = QLineEdit()
+        det_form.addRow("Quantity:", self.qty_edit)
+        det_form.addRow("Unit:", self.unit_edit)
+        det_form.addRow("Note:", self.note_edit)
+        layout.addLayout(det_form)
+
+        # --- Buttons ---
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        layout.addWidget(self.buttons)
+
+    def _wire_signals(self):
+        self.buttons.accepted.connect(self._on_accept)
+        self.buttons.rejected.connect(self.reject)
+
+        self.btn_part_search.clicked.connect(self._search_parts)
+        self.room_combo.currentIndexChanged.connect(self._on_room_changed)
+        self.container_combo.currentIndexChanged.connect(self._on_container_changed)
+        self.shelf_combo.currentIndexChanged.connect(self._on_shelf_changed)
+        self.drawer_combo.currentIndexChanged.connect(self._on_drawer_changed)
+
+    # ---------- Data loaders ----------
+    def _load_initial(self):
+        # Load some rooms
+        with self.db_manager.session_scope() as s:
+            rooms = s.query(SiteLocation).order_by(SiteLocation.title.asc()).limit(100).all()
+        self.room_combo.clear()
+        for r in rooms:
+            self.room_combo.addItem(f"{r.title} (Room {r.room_number}, {r.site_area})", r.id)
+        # containers/shelves/drawers/slots will be filled by change handlers
+
+    def _search_parts(self):
+        text = (self.part_search.text() or "").strip()
+        like = f"%{text}%"
+        with self.db_manager.session_scope() as s:
+            q = s.query(Part)
+            if text:
+                # Try match SKU or name; adjust fields if your schema differs
+                q = q.filter(
+                    (Part.part_number.ilike(like)) |  # SKU
+                    (Part.name.ilike(like))
+                )
+            q = q.order_by(Part.part_number.asc()).limit(200)
+            parts = q.all()
+        self.part_combo.clear()
+        for p in parts:
+            display = f"{getattr(p, 'part_number', f'#{p.id}')} – {getattr(p, 'name','')}"
+            self.part_combo.addItem(display, p.id)
+
+    def _load_containers(self):
+        self.container_combo.clear()
+        room_id = self._current_id(self.room_combo)
+        if not room_id:
+            return
+        with self.db_manager.session_scope() as s:
+            containers = s.query(Container).filter(
+                Container.position.has(site_location_id=room_id)
+            ).order_by(Container.name.asc()).all()
+        for c in containers:
+            self.container_combo.addItem(getattr(c, "name", f"Container {c.id}"), c.id)
+
+    def _load_shelves(self):
+        self.shelf_combo.clear()
+        cont_id = self._current_id(self.container_combo)
+        if not cont_id:
+            return
+        with self.db_manager.session_scope() as s:
+            shelves = s.query(Shelf).filter(Shelf.container_id == cont_id).order_by(Shelf.id.asc()).all()
+        for sh in shelves:
+            self.shelf_combo.addItem(getattr(sh, "label", f"Shelf {sh.id}"), sh.id)
+
+    def _load_drawers(self):
+        self.drawer_combo.clear()
+        shelf_id = self._current_id(self.shelf_combo)
+        if not shelf_id:
+            return
+        with self.db_manager.session_scope() as s:
+            drawers = s.query(Drawer).filter(Drawer.shelf_id == shelf_id).order_by(Drawer.id.asc()).all()
+        for dr in drawers:
+            self.drawer_combo.addItem(getattr(dr, "label", f"Drawer {dr.id}"), dr.id)
+
+    def _load_slots(self):
+        if not self._has_drawer_slot:
+            return
+        self.slot_combo.clear()
+        drawer_id = self._current_id(self.drawer_combo)
+        if not drawer_id:
+            return
+        DrawerSlot = globals().get("DrawerSlot")
+        if not DrawerSlot:
+            return
+        with self.db_manager.session_scope() as s:
+            slots = s.query(DrawerSlot).filter(DrawerSlot.drawer_id == drawer_id).order_by(DrawerSlot.id.asc()).all()
+        for sl in slots:
+            label = getattr(sl, "slot_label", None) or f"R{getattr(sl,'row_index','-')}-C{getattr(sl,'col_index','-')}"
+            self.slot_combo.addItem(label, sl.id)
+
+    # ---------- Change handlers ----------
+    def _on_room_changed(self, _):
+        self._load_containers()
+        self._load_shelves()
+        self._load_drawers()
+        self._load_slots()
+
+    def _on_container_changed(self, _):
+        self._load_shelves()
+        self._load_drawers()
+        self._load_slots()
+
+    def _on_shelf_changed(self, _):
+        self._load_drawers()
+        self._load_slots()
+
+    def _on_drawer_changed(self, _):
+        self._load_slots()
+
+    # ---------- Accept ----------
+    def _on_accept(self):
+        request_id = set_request_id()
+
+        part_id   = self._current_id(self.part_combo)
+        drawer_id = self._current_id(self.drawer_combo)
+        slot_id   = self._current_id(self.slot_combo) if self._has_drawer_slot else None
+
+        if not part_id:
+            QMessageBox.warning(self, "Missing Data", "Please select a Part.")
+            return
+        if not drawer_id and not slot_id:
+            QMessageBox.warning(self, "Missing Location", "Pick at least a Drawer (or Slot if available).")
+            return
+
+        qty  = int(self.qty_edit.value() or 0)
+        unit = (self.unit_edit.text() or "").strip()
+        note = (self.note_edit.text() or "").strip()
+
+        try:
+            with self.db_manager.session_scope() as s:
+                inv = Inventory(
+                    part_id=part_id,
+                    drawer_id=drawer_id if not slot_id else None,  # prefer slot if chosen
+                    drawer_slot_id=slot_id if slot_id else None,
+                    quantity=qty,
+                    unit=unit or None,
+                    note=note or None,
+                )
+                s.add(inv)
+            info_id(f"[AddStock] Added part_id={part_id} qty={qty} unit={unit} at drawer={drawer_id} slot={slot_id}", request_id)
+            self.accept()
+        except Exception as e:
+            error_id(f"[AddStock] Failed: {e}", request_id)
+            QMessageBox.critical(self, "Error", f"Failed to add stock:\n{e}")
+
+    # ---------- Helpers ----------
+    def _current_id(self, combo: QComboBox):
+        idx = combo.currentIndex()
+        return combo.itemData(idx) if idx >= 0 else None
 
 
 class NewEntityDialog(QDialog):
@@ -602,9 +892,12 @@ class MainWindow(QMainWindow):
             if hasattr(self, "remote_inventory"):
                 self.remote_inventory.set_db_manager(self.db_manager)
 
-            # ✅ Add this:
             if hasattr(self, "add_location_widget"):
                 self.add_location_widget.set_db_manager(self.db_manager)
+
+            # ✅ Add this line
+            if hasattr(self, "inventory_widget"):
+                self.inventory_widget.set_db_manager(self.db_manager)
 
             # Inspect DB
             tables, counts = self.db_manager.inspect()
@@ -725,11 +1018,13 @@ class AddLocationWidget(QWidget):
         grp_cont = QGroupBox("Container")
         frm_cont = QFormLayout(grp_cont)
         self.cont_pick = QComboBox()
+        self.cont_code = QLineEdit()  # <-- NEW
         self.cont_name = QLineEdit()
         self.btn_cont_refresh = QPushButton("Refresh")
         self.btn_cont_add = QPushButton("Add Container")
         self.btn_cont_add.setEnabled(False)
         frm_cont.addRow("Pick Existing:", self.cont_pick)
+        frm_cont.addRow("Code (required):", self.cont_code)  # <-- NEW
         frm_cont.addRow("Name (e.g., 'Rack 12'):", self.cont_name)
         row_cont_btns = QHBoxLayout()
         row_cont_btns.addWidget(self.btn_cont_refresh)
@@ -740,17 +1035,24 @@ class AddLocationWidget(QWidget):
         # --- Shelf group ---
         grp_shelf = QGroupBox("Shelf")
         frm_shelf = QFormLayout(grp_shelf)
+
         self.shelf_pick = QComboBox()
-        self.shelf_label = QLineEdit()
+        self.shelf_code = QLineEdit()  # <-- NEW (required)
+        self.shelf_name = QLineEdit()  # <-- NEW (required)
+
         self.btn_shelf_refresh = QPushButton("Refresh")
         self.btn_shelf_add = QPushButton("Add Shelf")
         self.btn_shelf_add.setEnabled(False)
+
         frm_shelf.addRow("Pick Existing:", self.shelf_pick)
-        frm_shelf.addRow("Label (e.g., 'Shelf A'):", self.shelf_label)
+        frm_shelf.addRow("Code (required):", self.shelf_code)  # <-- NEW
+        frm_shelf.addRow("Name (required):", self.shelf_name)  # <-- NEW
+
         row_shelf_btns = QHBoxLayout()
         row_shelf_btns.addWidget(self.btn_shelf_refresh)
         row_shelf_btns.addWidget(self.btn_shelf_add)
         frm_shelf.addRow(row_shelf_btns)
+
         outer.addWidget(grp_shelf)
 
         # --- Drawer group ---
@@ -933,17 +1235,19 @@ class AddLocationWidget(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to create Site Location:\n{e}")
 
     def _add_container(self):
-        """
-        Containers are linked to Position; ensure there's a Position tied to the selected SiteLocation.
-        """
         from app.modules.configuration import info_id, error_id, set_request_id
         from app.modules.database.shopsync_db import Container, Position
         request_id = set_request_id()
 
         site_id = self._current_id(self.site_pick)
-        name = self.cont_name.text().strip()
+        code = (self.cont_code.text() or "").strip()  # <-- NEW
+        name = (self.cont_name.text() or "").strip()
+
         if not site_id:
             QMessageBox.warning(self, "Select Site", "Pick a Site Location first.")
+            return
+        if not code:
+            QMessageBox.warning(self, "Missing Data", "Container 'Code' is required.")
             return
         if not name:
             QMessageBox.warning(self, "Missing Data", "Please enter a Container name.")
@@ -951,46 +1255,73 @@ class AddLocationWidget(QWidget):
 
         try:
             with self.db_manager.session_scope() as s:
-                # find or create a position attached to this site location
                 pos = s.query(Position).filter(Position.site_location_id == site_id).first()
                 if not pos:
                     pos = Position(site_location_id=site_id)
-                    s.add(pos)
+                    s.add(pos);
                     s.flush()
-                obj = Container(name=name, position_id=pos.id)
-                s.add(obj)
+
+                obj = Container(code=code, name=name, position_id=pos.id)  # <-- include code
+                s.add(obj);
                 s.flush()
-                info_id(f"[AddLocation] Created Container id={obj.id} (position_id={pos.id})", request_id)
+                info_id(f"[AddLocation] Created Container id={obj.id} (code={code}, position_id={pos.id})", request_id)
+
+            self.cont_code.clear()  # <-- NEW
             self.cont_name.clear()
             self._load_containers()
             self._notify_inventory_refresh()
+
         except Exception as e:
             error_id(f"[AddLocation] Failed to create Container: {e}", request_id)
             QMessageBox.critical(self, "Error", f"Failed to create Container:\n{e}")
 
     def _add_shelf(self):
         from app.modules.configuration import info_id, error_id, set_request_id
-        from app.modules.database.shopsync_db import Shelf
+        from app.modules.database.shopsync_db import Shelf, Position
         request_id = set_request_id()
 
         cont_id = self._current_id(self.cont_pick)
-        label = self.shelf_label.text().strip()
+        code = (self.shelf_code.text() or "").strip()
+        name = (self.shelf_name.text() or "").strip()
+
         if not cont_id:
             QMessageBox.warning(self, "Select Container", "Pick a Container first.")
             return
-        if not label:
-            QMessageBox.warning(self, "Missing Data", "Please enter a Shelf label.")
+        if not code:
+            QMessageBox.warning(self, "Missing Data", "Shelf 'Code' is required.")
+            return
+        if not name:
+            QMessageBox.warning(self, "Missing Data", "Shelf 'Name' is required.")
             return
 
         try:
             with self.db_manager.session_scope() as s:
-                obj = Shelf(container_id=cont_id, label=label)
-                s.add(obj)
-                s.flush()
-                info_id(f"[AddLocation] Created Shelf id={obj.id}", request_id)
-            self.shelf_label.clear()
+                # We need a position_id (unique scope for shelves). Use the site’s Position.
+                site_id = self._current_id(self.site_pick)
+                pos = s.query(Position).filter(Position.site_location_id == site_id).first()
+                if not pos:
+                    pos = Position(site_location_id=site_id)
+                    s.add(pos)
+                    s.flush()
+
+                # Create (or find) the shelf within (position_id, container_id, code)
+                # You can use add_shelf or find_or_create per your model.
+                obj = Shelf.find_or_create(
+                    session=s,
+                    position_id=pos.id,
+                    code=code,
+                    name=name,
+                    container_id=cont_id,
+                    description=None,
+                )
+                info_id(f"[AddLocation] Created/Found Shelf id={obj.id} (code={code})", request_id)
+
+            # Clear inputs and refresh list
+            self.shelf_code.clear()
+            self.shelf_name.clear()
             self._load_shelves()
             self._notify_inventory_refresh()
+
         except Exception as e:
             error_id(f"[AddLocation] Failed to create Shelf: {e}", request_id)
             QMessageBox.critical(self, "Error", f"Failed to create Shelf:\n{e}")
