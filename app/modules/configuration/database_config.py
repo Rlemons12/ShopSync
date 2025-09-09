@@ -26,7 +26,7 @@ import os
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Optional, Callable
+from typing import Optional
 
 # --- Optional dotenv load (safe no-op if not installed) ---
 try:
@@ -35,65 +35,67 @@ try:
 except Exception:
     pass
 
-from sqlalchemy import create_engine, event, text, inspect as sa_inspect
+from sqlalchemy import create_engine, event, inspect as sa_inspect
 from sqlalchemy.orm import sessionmaker, Session
 
-# ----------------------------------------------------------------------
-# Import your Base (models) — try a couple of common paths
-# ----------------------------------------------------------------------
-Base = None
-_models_import_errors = []
+# Project config for default URL
+try:
+    from app.modules.configuration.config import DATABASE_URL  # adjust if your path differs
+except Exception as e:
+    # Fallback to env-only if config module isn't available at import time
+    DATABASE_URL = os.getenv("DB_URL", "sqlite:///shopsync.db")
 
-def _import_models():
-    global Base
+# ----------------------------------------------------------------------
+# Logging wrappers (use your project logger if available; else minimal)
+# ----------------------------------------------------------------------
+try:
+    from app.modules.configuration.log_config import (
+        info_id, debug_id, error_id, set_request_id, get_request_id
+    )
+except Exception:
+    import logging
+    _logger = logging.getLogger("dbconfig")
+    if not _logger.handlers:
+        _logger.addHandler(logging.StreamHandler(sys.stdout))
+    _logger.setLevel(logging.INFO)
+
+    _REQ_ID = None
+    def set_request_id(req_id: Optional[str] = None):
+        nonlocal_vars = globals()
+        rid = req_id or "REQ-DBCONF"
+        nonlocal_vars["_REQ_ID"] = rid
+        return rid
+    def get_request_id() -> str:
+        return globals().get("_REQ_ID") or "REQ-DBCONF"
+    def info_id(msg: str, request_id: Optional[str] = None): _logger.info(f"[{get_request_id()}] {msg}")
+    def debug_id(msg: str, request_id: Optional[str] = None): _logger.debug(f"[{get_request_id()}] {msg}")
+    def error_id(msg: str, request_id: Optional[str] = None): _logger.error(f"[{get_request_id()}] {msg}")
+
+# ----------------------------------------------------------------------
+# Lazy model loader (NO top-level imports of shopsync_db)
+# ----------------------------------------------------------------------
+def _get_base():
+    """
+    Import and return the project's SQLAlchemy Base lazily to avoid circular imports.
+    Tries a few common module paths; adjust the list as needed.
+    """
     candidates = [
-        # Adjust these to your project’s layout if needed
         "app.modules.database.shopsync_db",
         "modules.emtacdb.shopsync_db",
-        "shopsync_db",  # local file next to the running script
+        "shopsync_db",
     ]
+    errors = []
     for modname in candidates:
         try:
             mod = __import__(modname, fromlist=["Base"])
-            Base = getattr(mod, "Base", None)
-            if Base is not None:
-                return
+            base = getattr(mod, "Base", None)
+            if base is not None:
+                return base
         except Exception as e:
-            _models_import_errors.append(f"{modname}: {e!r}")
-
+            errors.append(f"{modname}: {e!r}")
     raise ImportError(
-        "Could not import Base from shopsync_db. Tried:\n  - " +
-        "\n  - ".join(_models_import_errors)
+        "Could not import Base from shopsync_db. Tried:\n  - " + "\n  - ".join(errors)
     )
-
-_import_models()
-
-# ----------------------------------------------------------------------
-# Optional logging wrappers (fallback to basic logging if missing)
-# ----------------------------------------------------------------------
-try:
-    from modules.configuration.log_config import info_id, debug_id, error_id, set_request_id, get_request_id
-except Exception:
-    try:
-        from app.modules.configuration.log_config import info_id, debug_id, error_id, set_request_id, get_request_id
-    except Exception:
-        import logging
-        _logger = logging.getLogger("dbconfig")
-        if not _logger.handlers:
-            _logger.addHandler(logging.StreamHandler(sys.stdout))
-        _logger.setLevel(logging.INFO)
-
-        _REQ_ID = None
-        def set_request_id(req_id: Optional[str] = None):
-            nonlocal_vars = globals()
-            rid = req_id or "REQ-DBCONF"
-            nonlocal_vars["_REQ_ID"] = rid
-            return rid
-        def get_request_id() -> str:
-            return globals().get("_REQ_ID") or "REQ-DBCONF"
-        def info_id(msg: str, request_id: Optional[str] = None): _logger.info(f"[{get_request_id()}] {msg}")
-        def debug_id(msg: str, request_id: Optional[str] = None): _logger.debug(f"[{get_request_id()}] {msg}")
-        def error_id(msg: str, request_id: Optional[str] = None): _logger.error(f"[{get_request_id()}] {msg}")
 
 # ----------------------------------------------------------------------
 # Config dataclass
@@ -111,8 +113,17 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return val.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 def _default_db_url() -> str:
-    # Prefer explicit env, else local sqlite file
-    return os.getenv("DB_URL", "sqlite:///shopsync.db")
+    """
+    Build the default DB URL.
+    Priority:
+      1. Explicit environment variable DB_URL
+      2. DATABASE_URL from config.py (if importable)
+      3. sqlite:///shopsync.db
+    """
+    env_url = os.getenv("DB_URL")
+    if env_url:
+        return env_url
+    return DATABASE_URL or "sqlite:///shopsync.db"
 
 # ----------------------------------------------------------------------
 # DatabaseConfig
@@ -133,27 +144,34 @@ class DatabaseConfig:
         db_url: Optional[str] = None,
         echo: Optional[bool] = None,
         enable_wal: Optional[bool] = None,
+        *,
+        logger_name: str = "shopsync",
     ):
-        self.request_id = set_request_id()  # ensure logging correlates
+        self.request_id = set_request_id()  # correlate logs
         self.settings = _Settings(
             db_url=db_url or _default_db_url(),
             echo=echo if echo is not None else _env_bool("DB_ECHO", False),
             enable_wal=enable_wal if enable_wal is not None else _env_bool("DB_ENABLE_WAL", False),
         )
-        info_id(f"[DatabaseConfig] DB={self.settings.db_url} echo={self.settings.echo} wal={self.settings.enable_wal}",
-                self.request_id)
+        info_id(
+            f"[DatabaseConfig] DB={self.settings.db_url} echo={self.settings.echo} wal={self.settings.enable_wal}",
+            self.request_id,
+        )
 
-        # Create engine and session factory
+        # Engine + session factory (expire_on_commit=False avoids detached/refresh issues in UI)
         self._engine = create_engine(self.settings.db_url, echo=self.settings.echo, future=True)
-        self._SessionFactory = sessionmaker(bind=self._engine, autoflush=False, autocommit=False, expire_on_commit=False)
+        self._SessionFactory = sessionmaker(
+            bind=self._engine,
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+        )
 
-        # If SQLite ⇒ apply PRAGMAs
+        # SQLite PRAGMAs, if applicable
         if self._is_sqlite():
             self._install_sqlite_pragmas()
 
-        # You can add PostgreSQL-specific tuning here if desired.
-
-    # ------------- Public API ----------------
+    # ---------- Public API ----------
     def get_engine(self):
         return self._engine
 
@@ -179,25 +197,29 @@ class DatabaseConfig:
         finally:
             session.close()
 
-    # ----- Schema helpers -----
+    # ---------- Schema helpers (lazy Base import) ----------
     def create_all(self):
         """Create all tables from models' Base.metadata."""
+        Base = _get_base()
         Base.metadata.create_all(self._engine)
         info_id("[DatabaseConfig] create_all complete", self.request_id)
 
     def drop_all(self):
         """Drop all tables (DANGEROUS; typically for dev/test)."""
+        Base = _get_base()
         Base.metadata.drop_all(self._engine)
         info_id("[DatabaseConfig] drop_all complete", self.request_id)
 
     def print_inspect(self):
         """Print a compact schema inventory."""
+        # Not strictly needed to import Base here unless you reference metadata;
+        # we inspect via engine.
         insp = sa_inspect(self._engine)
         for tbl in insp.get_table_names():
             cols = [c["name"] for c in insp.get_columns(tbl)]
             info_id(f"[inspect] {tbl}: {', '.join(cols)}", self.request_id)
 
-    # ------------- Internals -----------------
+    # ---------- Internals ----------
     def _is_sqlite(self) -> bool:
         return self.settings.db_url.startswith("sqlite")
 
@@ -218,16 +240,16 @@ class DatabaseConfig:
                 cursor.close()
 
 # ----------------------------------------------------------------------
-# Optional: a thin "DB Manager" wrapper (used by older scripts)
+# Optional: a thin "DB Manager" wrapper (for older code paths)
 # ----------------------------------------------------------------------
 class ShopSyncDatabase:
     """
-    Backward-compatible helper class mirroring your initializer’s expectations:
+    Backward-compatible helper class mirroring your initializer's expectations:
       - create_all(), drop_all(), print_inspect()
       - exposes .session_scope() for transactional work
 
     This lets scripts that import ShopSyncDatabase keep working, while internally
-    leveraging DatabaseConfig.
+    leveraging DatabaseConfig (single source of truth).
     """
     def __init__(self, db_url: Optional[str] = None, echo: bool = False, enable_wal: bool = False):
         self.cfg = DatabaseConfig(db_url=db_url, echo=echo, enable_wal=enable_wal)

@@ -1,76 +1,88 @@
 # Standard library
 from io import StringIO
 from typing import Optional, List
-from sqlalchemy import Column
+
+# SQLAlchemy core/ORM
+from sqlalchemy import (
+    Column, Enum, ForeignKey, Index, Integer, String, UniqueConstraint, select
+)
 from sqlalchemy.types import JSON
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy import Column, Enum, ForeignKey, Index, Integer, String, UniqueConstraint, select
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, joinedload, relationship
-from sqlalchemy.orm import relationship, Session, joinedload
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, relationship, joinedload
 
-# Base class for models
-from app.modules.configuration.base import Base  # <-- from your base.py file
+# Base class for models (pure; no db manager here)
+from app.modules.configuration.base import Base
 
-# Database configuration (for sessions)
-from app.modules.database.db_manager import ShopSyncDatabase  # <-- for get_main_session()
-
-# Logging utilities & decorators
+# Logging utilities
 from app.modules.configuration.log_config import (
     logger,
     with_request_id,
     info_id,
     debug_id,
     warning_id,
-    error_id
+    error_id,
 )
-
-DatabaseConfig = ShopSyncDatabase
 
 # -----------------------------
 # Main Tables (drop-in fixed)
 # -----------------------------
 
+
+# -----------------------------
+# Main Tables (drop-in fixed)
+# -----------------------------
+
+# -----------------------------
+# Main Tables (fixed)
+# -----------------------------
+
 class Campus(Base):
-    """Defines the building complex (campus/site) that contains buildings."""
-    __tablename__ = 'campus'  # keep legacy name to avoid migrations
+    """A campus/site that contains buildings."""
+    __tablename__ = 'campus'
 
     id          = Column(Integer, primary_key=True)
-    name        = Column(String, nullable=False)
-    description = Column(String, nullable=True)
-    city        = Column(String, nullable=True)
-    state       = Column(String, nullable=True)
-    country     = Column(String, nullable=True)
+    name        = Column(String, nullable=False, unique=False)
+    description = Column(String)
+    city        = Column(String)
+    state       = Column(String)
+    country     = Column(String)
 
-    # One complex -> many buildings
+    # One campus -> many buildings
     buildings = relationship(
         "Building",
-        back_populates="building_complex",
+        back_populates="campus",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    # One campus -> many positions (optional but required if Position.campus uses back_populates)
+    positions = relationship(
+        "Position",
+        back_populates="campus",
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
 
     def __repr__(self):
-        return f"<BuildingComplex id={self.id} name={self.name!r}>"
+        return f"<Campus id={self.id} name={self.name!r}>"
+
 
 class Building(Base):
-    """A building that belongs to a complex."""
+    """A building that belongs to a campus."""
     __tablename__ = 'building'
 
-    id                  = Column(Integer, primary_key=True)
-    name                = Column(String, nullable=False)
-    description         = Column(String, nullable=True)
-    address             = Column(String, nullable=True)
+    id          = Column(Integer, primary_key=True)
+    name        = Column(String, nullable=False)
+    description = Column(String)
+    address     = Column(String)
 
+    campus_id = Column(Integer, ForeignKey('campus.id', ondelete="CASCADE"),
+                       nullable=False, index=True)
 
-    # FK targets legacy 'buildingComplex' table above
-    id_building_complex = Column(Integer, ForeignKey('buildingComplex.id', ondelete="CASCADE"), nullable=False)
-
-    # Many buildings -> one complex
+    # Many buildings -> one campus
     campus = relationship("Campus", back_populates="buildings")
 
-    # One building -> many site locations (rooms/areas)
+    # One building -> many site locations
     site_locations = relationship(
         "SiteLocation",
         back_populates="building",
@@ -78,8 +90,17 @@ class Building(Base):
         passive_deletes=True,
     )
 
+    # One building -> many positions
+    positions = relationship(
+        "Position",
+        back_populates="building",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
     def __repr__(self):
-        return f"<Building id={self.id} name={self.name!r} complex_id={self.id_building_complex}>"
+        return f"<Building id={self.id} name={self.name!r} campus_id={self.campus_id}>"
+
 
 class SiteLocation(Base):
     """A specific location/room/area inside a building."""
@@ -89,137 +110,22 @@ class SiteLocation(Base):
     title       = Column(String, nullable=False)
     room_number = Column(String, nullable=False)
     site_area   = Column(String, nullable=False)
-    building_id = Column(Integer, ForeignKey('building.id', ondelete="CASCADE"))  # keep nullable if you need
+    building_id = Column(Integer, ForeignKey('building.id', ondelete="CASCADE"))
 
-    # Relationships
-    position = relationship('Position', back_populates="site_location")
+    # Many site locations -> one building
     building = relationship('Building', back_populates='site_locations')
 
+    # One site location -> many positions
+    positions = relationship(
+        'Position',
+        back_populates='site_location',
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
-    @classmethod
-    @with_request_id
-    def add_site_location(cls, session, title, room_number, site_area, request_id=None):
-        """
-        Add a new site location to the database.
+    # (Your classmethods can stay as-is, but if you referenced `site_location.position`,
+    # update to `site_location.positions` since it's a collection.)
 
-        Args:
-            session: SQLAlchemy database session
-            title (str): Title of the site location
-            room_number (str): Room number of the site location
-            site_area (str): Site area of the site location
-            request_id (str, optional): Unique identifier for the request
-
-        Returns:
-            SiteLocation: The newly created site location object
-        """
-        new_site_location = cls(
-            title=title,
-            room_number=room_number,
-            site_area=site_area
-        )
-
-        session.add(new_site_location)
-        session.commit()
-
-        logger.info(f"Created new site location: '{title}' in room {room_number}, area {site_area}")
-        return new_site_location
-
-    @classmethod
-    @with_request_id
-    def delete_site_location(cls, session, site_location_id, request_id=None):
-        """
-        Delete a site location from the database.
-
-        Args:
-            session: SQLAlchemy database session
-            site_location_id (int): ID of the site location to delete
-            request_id (str, optional): Unique identifier for the request
-
-        Returns:
-            bool: True if deletion was successful, False if site location not found
-        """
-        site_location = session.query(cls).filter(cls.id == site_location_id).first()
-
-        if site_location:
-            session.delete(site_location)
-            session.commit()
-            logger.info(f"Deleted site location ID {site_location_id}")
-            return True
-        else:
-            logger.warning(f"Failed to delete site location ID {site_location_id} - not found")
-            return False
-
-    @classmethod
-    @with_request_id
-    def find_related_entities(cls, session, identifier, is_id=True, request_id=None):
-        """
-        Find all related entities for a site location.
-
-        Args:
-            session: SQLAlchemy database session
-            identifier: Either site location ID (int) or title (str)
-            is_id (bool): If True, identifier is an ID, otherwise it's a title
-            request_id (str, optional): Unique identifier for the request
-
-        Returns:
-            dict: Dictionary containing:
-                - 'site_location': The found site location object
-                - 'downward': Dictionary containing:
-                    - 'positions': List of all positions at this site location
-        """
-        # Find the site location
-        if is_id:
-            site_location = session.query(cls).filter(cls.id == identifier).first()
-        else:
-            site_location = session.query(cls).filter(cls.title == identifier).first()
-
-        if not site_location:
-            logger.warning(f"Site location not found for identifier: {identifier}")
-            return None
-
-        # Going downward in the hierarchy
-        downward = {
-            'positions': site_location.position
-        }
-
-        logger.info(f"Found related entities for site location ID {site_location.id}")
-        return {
-            'site_location': site_location,
-            'downward': downward
-        }
-
-    @classmethod
-    @with_request_id
-    def find_or_create(cls, session, title, room_number="Unknown", site_area="General", request_id=None):
-        """
-        Find a SiteLocation by title, or create it if it doesn't exist.
-
-        Args:
-            session: SQLAlchemy database session
-            title (str): Title of the site location
-            room_number (str): Room number (default "Unknown")
-            site_area (str): Site area (default "General")
-            request_id (str, optional): Unique identifier for the request
-
-        Returns:
-            SiteLocation: The found or newly created site location object
-        """
-        site_location = session.query(cls).filter_by(title=title).first()
-
-        if site_location:
-            logger.info(f"Found existing site location '{title}'", extra={'request_id': request_id})
-        else:
-            site_location = cls(
-                title=title,
-                room_number=room_number,
-                site_area=site_area
-            )
-            session.add(site_location)
-            session.commit()
-            logger.info(f"Created new site location '{title}' with room '{room_number}' and area '{site_area}'",
-                        extra={'request_id': request_id})
-
-        return site_location
 
 class Position(Base):
     __tablename__ = 'position'
@@ -247,9 +153,9 @@ class Position(Base):
     drawing_position = relationship("DrawingPositionAssociation", back_populates="position")
     #problem_position = relationship("ProblemPositionAssociation", back_populates="position")
     #completed_document_position_association = relationship("CompletedDocumentPositionAssociation", back_populates="position")
-    building = relationship("Building", back_populates="position")
-    campus = relationship("Campus", back_populates="position")
-    site_location = relationship("SiteLocation", back_populates="position")
+    building = relationship("Building", back_populates="positions")
+    campus = relationship("Campus", back_populates="positions")
+    site_location = relationship("SiteLocation", back_populates="positions")
     #position_tasks = relationship("TaskPositionAssociation", back_populates="position", cascade="all, delete-orphan")
     tool_position_association = relationship("ToolPositionAssociation", back_populates="position")
     subassembly = relationship("Subassembly", back_populates="position")
@@ -430,6 +336,10 @@ class Position(Base):
         """
         # 1) ensure we have a session
         if session is None:
+
+            # Lazy import to avoid circulars at module import time
+
+            from app.modules.configuration.database_config import DatabaseConfig
             session = DatabaseConfig().get_main_session()
 
         # 2) log input parameters - FIXED
@@ -494,6 +404,8 @@ class Position(Base):
         """
         # Ensure a session is available, if not use DatabaseConfig to get it
         if session is None:
+
+            from app.modules.configuration.database_config import DatabaseConfig
             session = DatabaseConfig().get_main_session()
 
         # Log input parameters with request ID
