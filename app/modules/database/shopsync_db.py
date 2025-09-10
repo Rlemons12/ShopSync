@@ -1684,16 +1684,25 @@ class Shelf(Base):
     @classmethod
     @with_request_id
     def find_or_create(
-        cls,
-        session: Session,
-        position_id: int,
-        code: str,
-        name: str,
-        container_id: int | None = None,
-        description: str | None = None,
-        request_id=None,
+            cls,
+            session: Session,
+            position_id: int,
+            code: str,
+            name: str,
+            container_id: int | None = None,
+            description: str | None = None,
+            request_id=None,
     ):
+        """
+        Idempotent helper:
+        - Normalizes code/name
+        - Looks for an existing Shelf scoped by (position_id, container_id, code)
+        - If not found, creates it (handles races by re-querying on failure)
+        """
+        # Normalize inputs (will raise if either is empty)
         code, name = cls._norm(code, name)
+
+        # Fast path: already exists?
         existing = session.execute(
             select(cls).where(
                 cls.position_id == position_id,
@@ -1704,15 +1713,33 @@ class Shelf(Base):
         if existing:
             info_id("Found Shelf '%s' on position %s", code, position_id, request_id)
             return existing
-        return cls.add_shelf(
-            session,
-            position_id,
-            code,
-            name,
-            container_id=container_id,
-            description=description,
-            request_id=request_id,
-        )
+
+        # Create path (commit happens inside add_shelf)
+        try:
+            return cls.add_shelf(
+                session,
+                position_id,
+                code,
+                name,
+                container_id=container_id,
+                description=description,
+                request_id=request_id,
+            )
+        except SQLAlchemyError:
+            # If a concurrent writer inserted the same row, re-select and return it
+            session.rollback()
+            retry = session.execute(
+                select(cls).where(
+                    cls.position_id == position_id,
+                    (cls.container_id.is_(container_id) if container_id is None else cls.container_id == container_id),
+                    cls.code == code,
+                )
+            ).scalar_one_or_none()
+            if retry:
+                info_id("Found Shelf '%s' on position %s (after race)", code, position_id, request_id)
+                return retry
+            # Otherwise, bubble up for caller to handle/log
+            raise
 
     @classmethod
     @with_request_id
@@ -1724,7 +1751,6 @@ class Shelf(Base):
             warning_id("Shelf %s not found", shelf_id, request_id)
             return None
         return {"shelf": obj, "downward": {"drawers": obj.drawers}}
-
 
 class Drawer(Base):
     __tablename__ = "drawer"
