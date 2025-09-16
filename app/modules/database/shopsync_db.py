@@ -1,14 +1,21 @@
 # Standard library
 from io import StringIO
 from typing import Optional, List
+import re
 
 # SQLAlchemy core/ORM
 from sqlalchemy import (
-    Column, Enum, ForeignKey, Index, Integer, String, UniqueConstraint, select
+    Column, Enum, ForeignKey, Index, Integer, String, UniqueConstraint, select, DateTime, Function
 )
 from sqlalchemy.types import JSON
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, relationship, joinedload
+from sqlalchemy import (
+    Column, Integer, String, Text, ForeignKey, Table, Index,
+    UniqueConstraint, and_, or_, func
+)
+from sqlalchemy.orm import relationship, Session, joinedload, selectinload
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
 # Base class for models (pure; no db manager here)
 from app.modules.configuration.base import Base
@@ -23,18 +30,10 @@ from app.modules.configuration.log_config import (
     error_id,
 )
 
-# -----------------------------
-# Main Tables (drop-in fixed)
-# -----------------------------
 
 
-# -----------------------------
-# Main Tables (drop-in fixed)
-# -----------------------------
 
-# -----------------------------
-# Main Tables (fixed)
-# -----------------------------
+
 
 class Campus(Base):
     """A campus/site that contains buildings."""
@@ -1504,19 +1503,216 @@ class AssemblyView(Base): # # TODO Rename to ComponentView
     component_assembly = relationship("ComponentAssembly", back_populates="assembly_view")
     position = relationship("Position", back_populates="assembly_view")
 
+class StorageAddress(Base):
+    __tablename__ = "storage_address"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    entity_type = Column(String, nullable=False)  # "container", "shelf", "drawer", "slot"
+    entity_id   = Column(Integer, nullable=False)
+
+    position_id   = Column(Integer, ForeignKey("position.id"), nullable=True)
+    container_id  = Column(Integer, ForeignKey("container.id"), nullable=True)
+    shelf_id      = Column(Integer, ForeignKey("shelf.id"), nullable=True)
+    drawer_id     = Column(Integer, ForeignKey("drawer.id"), nullable=True)
+    slot_id       = Column(Integer, ForeignKey("drawer_slot.id"), nullable=True)
+
+    path        = Column(String, nullable=False)   # e.g. "DT3-ST-01-D02-R01C01"
+    short_label = Column(String, nullable=True)
+    depth       = Column(Integer, nullable=False, default=0)
+    is_active   = Column(Integer, default=1)
+
+    # ----------------------------------------------------------
+    # Small helpers
+    # ----------------------------------------------------------
+    @staticmethod
+    def _tok(s: str | None) -> str:
+        return (s or "").strip().upper().replace(" ", "-")
+
+    @staticmethod
+    def _slice_area(area_name: str | None, start_1_based=3, length=2) -> str:
+        if not area_name:
+            return ""
+        s = max(0, start_1_based - 1)
+        return area_name[s:s+length]
+
+    @staticmethod
+    def _prefix_from_position(session: Session, position_id: int) -> str:
+        from app.modules.database.shopsync_db import Position
+        pos = session.get(Position, position_id)
+        if not pos:
+            return "POS"
+
+        campus_tok   = StorageAddress._tok(getattr(getattr(pos, "campus", None), "name", None) or "C")
+        building_tok = StorageAddress._tok(getattr(getattr(pos, "building", None), "name", None) or "B")
+        area_src     = getattr(getattr(pos, "site_location", None), "site_area", None) or "AREA"
+        area_tok     = StorageAddress._slice_area(StorageAddress._tok(area_src), 3, 2) or "XX"
+
+        building_num = re.sub(r"[^0-9]", "", building_tok) or building_tok
+        return f"{campus_tok}{building_num}-{area_tok}"
+
+    # ----------------------------------------------------------
+    # Upserts rewritten to accept ORM objects
+    # ----------------------------------------------------------
+    @classmethod
+    @with_request_id
+    def upsert_for_container(cls, session: Session, container, request_id=None):
+        from app.modules.database.shopsync_db import Container
+        if isinstance(container, int):
+            container = session.get(Container, container)
+        if not container:
+            raise ValueError("Container not found")
+
+        prefix = cls._prefix_from_position(session, container.position_id)
+        path = f"{prefix}-{container.id:02d}"
+
+        addr = session.execute(
+            select(cls).where(cls.entity_type == "container", cls.entity_id == container.id)
+        ).scalar_one_or_none()
+
+        if not addr:
+            addr = cls(
+                entity_type="container",
+                entity_id=container.id,
+                position_id=container.position_id,
+                container_id=container.id,
+                path=path,
+                depth=0,
+                is_active=True,
+            )
+            session.add(addr)
+        else:
+            addr.position_id = container.position_id
+            addr.container_id = container.id
+            addr.shelf_id = addr.drawer_id = addr.slot_id = None
+            addr.path = path
+            addr.depth = 0
+            addr.is_active = True
+
+        session.flush()
+        info_id(f"Address upserted for container {container.id} -> {path}", request_id=request_id)
+        return addr
+
+    @classmethod
+    @with_request_id
+    def upsert_for_shelf(cls, session: Session, shelf, request_id=None):
+        from app.modules.database.shopsync_db import Shelf
+        if isinstance(shelf, int):
+            shelf = session.get(Shelf, shelf)
+        if not shelf:
+            raise ValueError("Shelf not found")
+
+        # ✅ FIX: pass the Container object, not container_id
+        cont_addr = cls.upsert_for_container(session, shelf.container, request_id=request_id) if shelf.container else None
+        base = cont_addr.path if cont_addr else cls._prefix_from_position(session, shelf.position_id)
+        path = f"{base}-{shelf.id:02d}"
+
+        addr = session.execute(
+            select(cls).where(cls.entity_type == "shelf", cls.entity_id == shelf.id)
+        ).scalar_one_or_none()
+
+        if not addr:
+            addr = cls(
+                entity_type="shelf",
+                entity_id=shelf.id,
+                position_id=shelf.position_id,
+                container_id=shelf.container_id,
+                shelf_id=shelf.id,
+                path=path,
+                depth=1,
+                is_active=True,
+            )
+            session.add(addr)
+        else:
+            addr.position_id = shelf.position_id
+            addr.container_id = shelf.container_id
+            addr.shelf_id = shelf.id
+            addr.drawer_id = addr.slot_id = None
+            addr.path = path
+            addr.depth = 1
+            addr.is_active = True
+
+        session.flush()
+        info_id(f"Address upserted for shelf {shelf.id} -> {path}", request_id=request_id)
+        return addr
+
+    @classmethod
+    @with_request_id
+    def upsert_for_drawer(cls, session: Session, drawer, request_id=None):
+        from app.modules.database.shopsync_db import Drawer
+        if isinstance(drawer, int):
+            info_id(f"[upsert_for_drawer] Looking up Drawer id={drawer}", request_id=request_id)
+            drawer = session.get(Drawer, drawer)
+
+        if not drawer:
+            error_id("[upsert_for_drawer] Drawer not found", request_id=request_id)
+            return None
+
+        info_id(
+            f"[upsert_for_drawer] Drawer={drawer.id}, shelf_id={getattr(drawer, 'shelf_id', None)}, "
+            f"position_id={getattr(drawer, 'position_id', None)}",
+            request_id=request_id,
+        )
+
+        # Resolve parent shelf
+        shelf = getattr(drawer, "shelf", None)
+        if shelf:
+            info_id(f"[upsert_for_drawer] Drawer {drawer.id} has ORM shelf id={shelf.id}", request_id=request_id)
+        elif getattr(drawer, "shelf_id", None):
+            info_id(f"[upsert_for_drawer] Drawer {drawer.id} shelf is None, fetching by shelf_id={drawer.shelf_id}",
+                    request_id=request_id)
+            shelf = session.get(type(shelf), drawer.shelf_id)  # safe fallback
+
+        if not shelf:
+            error_id(f"[upsert_for_drawer] Drawer {drawer.id} has no shelf (shelf_id={drawer.shelf_id})",
+                     request_id=request_id)
+
+        # Then continue with your address building...
+
+    @classmethod
+    @with_request_id
+    def upsert_for_slot(cls, session: Session, slot, request_id=None):
+        from app.modules.database.shopsync_db import DrawerSlot, Drawer
+        debug_id(f"[upsert_for_slot] called with slot={slot!r} (type={type(slot)})", request_id=request_id)
+
+        if isinstance(slot, int):
+            slot_id = slot
+            slot = session.get(DrawerSlot, slot_id)
+            debug_id(f"[upsert_for_slot] looked up slot_id={slot_id} -> {slot!r}", request_id=request_id)
+
+        if slot is None:
+            error_id(f"[upsert_for_slot] Slot argument is None (caller passed {slot!r})", request_id=request_id)
+            import traceback
+            error_id("".join(traceback.format_stack(limit=5)), request_id=request_id)
+            return None
+
+        info_id(f"[upsert_for_slot] Slot id={slot.id}, drawer_id={getattr(slot, 'drawer_id', None)}",
+                request_id=request_id)
+
+        if not getattr(slot, "drawer_id", None) and not getattr(slot, "drawer", None):
+            error_id(f"[upsert_for_slot] Slot {slot.id} has no drawer_id and no drawer relationship!",
+                     request_id=request_id)
+            return None
+
+        drawer = slot.drawer or session.get(Drawer, slot.drawer_id)
+        if not drawer:
+            error_id(f"[upsert_for_slot] Drawer missing for slot {slot.id} (drawer_id={slot.drawer_id})",
+                     request_id=request_id)
+            return None
+
+        info_id(f"[upsert_for_slot] Slot {slot.id} resolved drawer {drawer.id}", request_id=request_id)
+        return slot
+
+
 class Container(Base):
     __tablename__ = "container"
 
     id = Column(Integer, primary_key=True)
     position_id = Column(Integer, ForeignKey("position.id", ondelete="CASCADE"), nullable=False)
-    code = Column(String, nullable=False)
     name = Column(String, nullable=False)
     description = Column(String, nullable=True)
 
-    # A container sits on an equipment Position
     position = relationship("Position", back_populates="container")
-
-    # A container can hold shelves
     shelves = relationship(
         "Shelf",
         back_populates="container",
@@ -1525,65 +1721,56 @@ class Container(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("position_id", "code", name="uq_container_pos_code"),
-        Index("ix_container_code", "code"),
+        UniqueConstraint("position_id", "name", name="uq_container_pos_name"),
+        Index("ix_container_name", "name"),
     )
 
     @staticmethod
-    def _norm(code: str, name: str) -> tuple[str, str]:
-        c = (code or "").strip()
+    def _norm(name: str) -> str:
         n = (name or "").strip()
-        if not c or not n:
-            raise ValueError("code and name are required.")
-        return c, n
-
+        if not n:
+            raise ValueError("name is required.")
+        return n
 
     @classmethod
     @with_request_id
-    def add_container(cls, session: Session, position_id: int, code: str, name: str,
-                      description: str = None, request_id=None):
-        code, name = cls._norm(code, name)
-        obj = cls(position_id=position_id, code=code, name=name,
-                  description=(description or "").strip() or None)
+    def add_container(cls, session: Session, position_id: int,
+                      name: str, description: str = None, request_id=None):
+        name = cls._norm(name)
+        obj = cls(
+            position_id=position_id,
+            name=name,
+            description=(description or "").strip() or None,
+        )
         session.add(obj)
-        try:
-            session.commit()
-            info_id("Created Container '%s' on position %s", code, position_id, request_id=request_id)
-            return obj
-        except SQLAlchemyError:
-            session.rollback()
-            error_id("Failed to create Container", exc_info=True, request_id=request_id)
-            raise
+        session.flush()
+        info_id(f"Created Container '{name}' on position {position_id}", request_id=request_id)
+        return obj
 
     @classmethod
     @with_request_id
     def delete_container(cls, session: Session, container_id: int, request_id=None) -> bool:
         obj = session.get(cls, container_id)
         if not obj:
-            warning_id("Container %s not found", container_id, request_id=request_id)
+            warning_id(f"Container {container_id} not found", request_id=request_id)
             return False
         session.delete(obj)
-        try:
-            session.commit()
-            info_id("Deleted Container %s", container_id, request_id=request_id)
-            return True
-        except SQLAlchemyError:
-            session.rollback()
-            error_id("Failed to delete Container", exc_info=True, request_id=request_id)
-            raise
+        session.flush()
+        info_id(f"Deleted Container {container_id}", request_id=request_id)
+        return True
 
     @classmethod
     @with_request_id
-    def find_or_create(cls, session: Session, position_id: int, code: str, name: str,
-                       description: str = None, request_id=None):
-        code, name = cls._norm(code, name)
+    def find_or_create(cls, session: Session, position_id: int,
+                       name: str, description: str = None, request_id=None):
+        name = cls._norm(name)
         existing = session.execute(
-            select(cls).where(cls.position_id == position_id, cls.code == code)
+            select(cls).where(cls.position_id == position_id, cls.name == name)
         ).scalar_one_or_none()
         if existing:
-            info_id("Found Container '%s' on position %s", code, position_id, request_id=request_id)
+            info_id(f"Found Container '{name}' on position {position_id}", request_id=request_id)
             return existing
-        return cls.add_container(session, position_id, code, name,
+        return cls.add_container(session, position_id, name,
                                  description=description, request_id=request_id)
 
     @classmethod
@@ -1593,7 +1780,7 @@ class Container(Base):
             select(cls).options(joinedload(cls.shelves)).where(cls.id == container_id)
         ).scalar_one_or_none()
         if not obj:
-            logger.warning(f"Container {container_id} not found", extra={'request_id': request_id} if request_id else None)
+            warning_id(f"Container {container_id} not found", request_id=request_id)
             return None
         return {"container": obj, "downward": {"shelves": obj.shelves}}
 
@@ -1602,9 +1789,7 @@ class Shelf(Base):
 
     id = Column(Integer, primary_key=True)
     position_id = Column(Integer, ForeignKey("position.id", ondelete="CASCADE"), nullable=False)
-    # shelf can be directly on equipment (no container)
     container_id = Column(Integer, ForeignKey("container.id", ondelete="CASCADE"), nullable=True)
-    code = Column(String, nullable=False)
     name = Column(String, nullable=False)
     description = Column(String, nullable=True)
 
@@ -1618,128 +1803,65 @@ class Shelf(Base):
     )
 
     __table_args__ = (
-        # unique within a position and (optionally) within a specific container
-        UniqueConstraint("position_id", "container_id", "code", name="uq_shelf_pos_container_code"),
-        Index("ix_shelf_code", "code"),
+        UniqueConstraint("position_id", "container_id", "name", name="uq_shelf_pos_container_name"),
+        Index("ix_shelf_name", "name"),
     )
 
     @staticmethod
-    def _norm(code: str, name: str) -> tuple[str, str]:
-        c = (code or "").strip()
+    def _norm(name: str) -> str:
         n = (name or "").strip()
-        if not c or not n:
-            raise ValueError("code and name are required.")
-        return c, n
+        if not n:
+            raise ValueError("Shelf name is required.")
+        return n
 
     @classmethod
     @with_request_id
-    def add_shelf(
-        cls,
-        session: Session,
-        position_id: int,
-        code: str,
-        name: str,
-        container_id: int | None = None,
-        description: str | None = None,
-        request_id=None,
-    ):
-        code, name = cls._norm(code, name)
+    def add_shelf(cls, session: Session, position_id: int, name: str,
+                  container_id: int | None = None, description: str | None = None, request_id=None):
+        name = cls._norm(name)
         obj = cls(
             position_id=position_id,
             container_id=container_id,
-            code=code,
             name=name,
             description=(description or "").strip() or None,
         )
         session.add(obj)
-        try:
-            session.commit()
-            where = f"container={container_id}" if container_id else "no-container"
-            # NOTE: request_id passed positionally (last arg)
-            info_id("Created Shelf '%s' on position %s (%s)", code, position_id, where, request_id)
-            return obj
-        except SQLAlchemyError:
-            session.rollback()
-            # positional request_id must come BEFORE any keyword args (e.g., exc_info)
-            error_id("Failed to create Shelf", request_id, exc_info=True)
-            raise
+        session.flush()
+        where = f"container={container_id}" if container_id else "no-container"
+        info_id(f"Created Shelf '{name}' on position {position_id} ({where})", request_id=request_id)
+        return obj
 
     @classmethod
     @with_request_id
     def delete_shelf(cls, session: Session, shelf_id: int, request_id=None) -> bool:
         obj = session.get(cls, shelf_id)
         if not obj:
-            warning_id("Shelf %s not found", shelf_id, request_id)
+            warning_id(f"Shelf {shelf_id} not found", request_id=request_id)
             return False
         session.delete(obj)
-        try:
-            session.commit()
-            info_id("Deleted Shelf %s", shelf_id, request_id)
-            return True
-        except SQLAlchemyError:
-            session.rollback()
-            error_id("Failed to delete Shelf", request_id, exc_info=True)
-            raise
+        session.flush()
+        info_id(f"Deleted Shelf {shelf_id}", request_id=request_id)
+        return True
 
     @classmethod
     @with_request_id
-    def find_or_create(
-            cls,
-            session: Session,
-            position_id: int,
-            code: str,
-            name: str,
-            container_id: int | None = None,
-            description: str | None = None,
-            request_id=None,
-    ):
-        """
-        Idempotent helper:
-        - Normalizes code/name
-        - Looks for an existing Shelf scoped by (position_id, container_id, code)
-        - If not found, creates it (handles races by re-querying on failure)
-        """
-        # Normalize inputs (will raise if either is empty)
-        code, name = cls._norm(code, name)
-
-        # Fast path: already exists?
+    def find_or_create(cls, session: Session, position_id: int,
+                       name: str, container_id: int | None = None,
+                       description: str | None = None, request_id=None):
+        name = cls._norm(name)
         existing = session.execute(
             select(cls).where(
                 cls.position_id == position_id,
                 (cls.container_id.is_(container_id) if container_id is None else cls.container_id == container_id),
-                cls.code == code,
+                cls.name == name,
             )
         ).scalar_one_or_none()
         if existing:
-            info_id("Found Shelf '%s' on position %s", code, position_id, request_id)
+            info_id(f"Found Shelf '{name}' on position {position_id}", request_id=request_id)
             return existing
-
-        # Create path (commit happens inside add_shelf)
-        try:
-            return cls.add_shelf(
-                session,
-                position_id,
-                code,
-                name,
-                container_id=container_id,
-                description=description,
-                request_id=request_id,
-            )
-        except SQLAlchemyError:
-            # If a concurrent writer inserted the same row, re-select and return it
-            session.rollback()
-            retry = session.execute(
-                select(cls).where(
-                    cls.position_id == position_id,
-                    (cls.container_id.is_(container_id) if container_id is None else cls.container_id == container_id),
-                    cls.code == code,
-                )
-            ).scalar_one_or_none()
-            if retry:
-                info_id("Found Shelf '%s' on position %s (after race)", code, position_id, request_id)
-                return retry
-            # Otherwise, bubble up for caller to handle/log
-            raise
+        return cls.add_shelf(session, position_id, name,
+                             container_id=container_id, description=description,
+                             request_id=request_id)
 
     @classmethod
     @with_request_id
@@ -1748,7 +1870,7 @@ class Shelf(Base):
             select(cls).options(joinedload(cls.drawers)).where(cls.id == shelf_id)
         ).scalar_one_or_none()
         if not obj:
-            warning_id("Shelf %s not found", shelf_id, request_id)
+            warning_id(f"Shelf {shelf_id} not found", request_id=request_id)
             return None
         return {"shelf": obj, "downward": {"drawers": obj.drawers}}
 
@@ -1757,9 +1879,7 @@ class Drawer(Base):
 
     id = Column(Integer, primary_key=True)
     position_id = Column(Integer, ForeignKey("position.id", ondelete="CASCADE"), nullable=False)
-    # drawer can be directly on equipment (no shelf)
     shelf_id = Column(Integer, ForeignKey("shelf.id", ondelete="CASCADE"), nullable=True)
-    code = Column(String, nullable=False)
     name = Column(String, nullable=False)
     description = Column(String, nullable=True)
 
@@ -1773,95 +1893,62 @@ class Drawer(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("position_id", "shelf_id", "code", name="uq_drawer_pos_shelf_code"),
-        Index("ix_drawer_code", "code"),
+        UniqueConstraint("position_id", "shelf_id", "name", name="uq_drawer_pos_shelf_name"),
+        Index("ix_drawer_name", "name"),
     )
 
     @staticmethod
-    def _norm(code: str, name: str) -> tuple[str, str]:
-        c = (code or "").strip()
+    def _norm(name: str) -> str:
         n = (name or "").strip()
-        if not c or not n:
-            raise ValueError("code and name are required.")
-        return c, n
+        if not n:
+            raise ValueError("Drawer name is required.")
+        return n
 
     @classmethod
     @with_request_id
-    def add_drawer(
-        cls,
-        session: Session,
-        position_id: int,
-        code: str,
-        name: str,
-        shelf_id: int | None = None,
-        description: str | None = None,
-        request_id=None,
-    ):
-        code, name = cls._norm(code, name)
+    def add_drawer(cls, session: Session, position_id: int, name: str,
+                   shelf_id: int | None = None, description: str | None = None, request_id=None):
+        name = cls._norm(name)
         obj = cls(
             position_id=position_id,
             shelf_id=shelf_id,
-            code=code,
             name=name,
             description=(description or "").strip() or None,
         )
         session.add(obj)
-        try:
-            session.commit()
-            where = f"shelf={shelf_id}" if shelf_id else "no-shelf"
-            info_id(
-                "Created Drawer '%s' on position %s (%s)",
-                code, position_id, where, request_id=request_id
-            )
-            return obj
-        except SQLAlchemyError:
-            session.rollback()
-            error_id("Failed to create Drawer", exc_info=True, request_id=request_id)
-            raise
+        session.flush()
+        info_id(f"Created Drawer '{name}' (pos={position_id}, shelf={shelf_id})", request_id=request_id)
+        return obj
 
     @classmethod
     @with_request_id
     def delete_drawer(cls, session: Session, drawer_id: int, request_id=None) -> bool:
         obj = session.get(cls, drawer_id)
         if not obj:
-            warning_id("Drawer %s not found", drawer_id, request_id=request_id)
+            warning_id(f"Drawer {drawer_id} not found", request_id=request_id)
             return False
         session.delete(obj)
-        try:
-            session.commit()
-            info_id("Deleted Drawer %s", drawer_id, request_id=request_id)
-            return True
-        except SQLAlchemyError:
-            session.rollback()
-            error_id("Failed to delete Drawer", exc_info=True, request_id=request_id)
-            raise
+        session.flush()
+        info_id(f"Deleted Drawer {drawer_id}", request_id=request_id)
+        return True
 
     @classmethod
     @with_request_id
-    def find_or_create(
-        cls,
-        session: Session,
-        position_id: int,
-        code: str,
-        name: str,
-        shelf_id: int | None = None,
-        description: str | None = None,
-        request_id=None,
-    ):
-        code, name = cls._norm(code, name)
+    def find_or_create(cls, session: Session, position_id: int, name: str,
+                       shelf_id: int | None = None, description: str | None = None, request_id=None):
+        name = cls._norm(name)
         existing = session.execute(
             select(cls).where(
                 cls.position_id == position_id,
                 (cls.shelf_id.is_(shelf_id) if shelf_id is None else cls.shelf_id == shelf_id),
-                cls.code == code,
+                cls.name == name,
             )
         ).scalar_one_or_none()
         if existing:
-            info_id("Found Drawer '%s' on position %s", code, position_id, request_id=request_id)
+            info_id(f"Found Drawer '{name}' on position {position_id}", request_id=request_id)
             return existing
-        return cls.add_drawer(
-            session, position_id, code, name, shelf_id=shelf_id, description=description, request_id=request_id
-        )
+        return cls.add_drawer(session, position_id, name,
+                              shelf_id=shelf_id, description=description, request_id=request_id)
 
     @classmethod
     @with_request_id
@@ -1870,20 +1957,16 @@ class Drawer(Base):
             select(cls).options(joinedload(cls.slots)).where(cls.id == drawer_id)
         ).scalar_one_or_none()
         if not obj:
-            warning_id("Drawer %s not found", drawer_id, request_id=request_id)
+            warning_id(f"Drawer {drawer_id} not found", request_id=request_id)
             return None
         return {"drawer": obj, "downward": {"slots": obj.slots}}
 
 class DrawerSlot(Base):
-    """
-    A specific "position in drawer" — addressable by a label (e.g., 'A5') or row/col.
-    """
     __tablename__ = "drawer_slot"
 
     id = Column(Integer, primary_key=True)
     drawer_id = Column(Integer, ForeignKey("drawer.id", ondelete="CASCADE"), nullable=False)
 
-    # Either use a human label (e.g., "A5") or row/col, or both.
     slot_label = Column(String, nullable=True)
     row_index = Column(Integer, nullable=True)
     col_index = Column(Integer, nullable=True)
@@ -1892,7 +1975,6 @@ class DrawerSlot(Base):
     drawer = relationship("Drawer", back_populates="slots")
 
     __table_args__ = (
-        # Prevent duplicate labels within the same drawer
         UniqueConstraint("drawer_id", "slot_label", name="uq_drawer_slot_label"),
         Index("ix_drawer_slot_label", "slot_label"),
     )
@@ -1903,21 +1985,18 @@ class DrawerSlot(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+
     @classmethod
     @with_request_id
-    def add_slot(
-        cls,
-        session: Session,
-        drawer_id: int,
-        *,
-        slot_label: str | None = None,
-        row_index: int | None = None,
-        col_index: int | None = None,
-        note: str | None = None,
-        request_id=None,
-    ):
+    def add_slot(cls, session: Session, drawer_id: int, *,
+                 slot_label: str | None = None,
+                 row_index: int | None = None,
+                 col_index: int | None = None,
+                 note: str | None = None,
+                 request_id=None):
         if not slot_label and row_index is None and col_index is None:
             raise ValueError("Provide slot_label or row/col to identify a slot.")
+
         obj = cls(
             drawer_id=drawer_id,
             slot_label=(slot_label or "").strip() or None,
@@ -1926,53 +2005,42 @@ class DrawerSlot(Base):
             note=(note or "").strip() or None,
         )
         session.add(obj)
-        try:
-            session.commit()
-            where = slot_label or f"r{row_index}c{col_index}"
-            info_id("Created DrawerSlot '%s' in drawer %s", where, drawer_id, request_id=request_id)
-            return obj
-        except SQLAlchemyError:
-            session.rollback()
-            error_id("Failed to create DrawerSlot", exc_info=True, request_id=request_id)
-            raise
+        session.flush()
+
+        where = slot_label or f"r{row_index}c{col_index}"
+        info_id(f"Created DrawerSlot '{where}' in drawer {drawer_id}", request_id=request_id)
+        return obj
 
     @classmethod
     @with_request_id
     def delete_slot(cls, session: Session, slot_id: int, request_id=None) -> bool:
         obj = session.get(cls, slot_id)
         if not obj:
-            warning_id("DrawerSlot %s not found", slot_id, request_id=request_id)
+            warning_id(f"DrawerSlot {slot_id} not found", request_id=request_id)
             return False
         session.delete(obj)
-        try:
-            session.commit()
-            info_id("Deleted DrawerSlot %s", slot_id, request_id=request_id)
-            return True
-        except SQLAlchemyError:
-            session.rollback()
-            error_id("Failed to delete DrawerSlot", exc_info=True, request_id=request_id)
-            raise
+        session.flush()
+        info_id(f"Deleted DrawerSlot {slot_id}", request_id=request_id)
+        return True
 
     @classmethod
     @with_request_id
-    def find_or_create(
-        cls,
-        session: Session,
-        drawer_id: int,
-        *,
-        slot_label: str | None = None,
-        row_index: int | None = None,
-        col_index: int | None = None,
-        note: str | None = None,
-        request_id=None,
-    ):
+    def find_or_create(cls, session: Session, drawer_id: int, *,
+                       slot_label: str | None = None,
+                       row_index: int | None = None,
+                       col_index: int | None = None,
+                       note: str | None = None,
+                       request_id=None):
         if slot_label:
             existing = session.execute(
-                select(cls).where(cls.drawer_id == drawer_id, cls.slot_label == slot_label.strip())
+                select(cls).where(
+                    cls.drawer_id == drawer_id,
+                    cls.slot_label == slot_label.strip()
+                )
             ).scalar_one_or_none()
             if existing:
                 return existing
-        # (Optional) add UNIQUE(drawer_id,row_index,col_index) if you need strict grid semantics.
+
         return cls.add_slot(
             session,
             drawer_id,
@@ -1988,10 +2056,139 @@ class DrawerSlot(Base):
     def find_related_entities(cls, session: Session, slot_id: int, request_id=None):
         obj = session.get(cls, slot_id)
         if not obj:
-            warning_id("DrawerSlot %s not found", slot_id, request_id=request_id)
+            warning_id(f"DrawerSlot {slot_id} not found", request_id=request_id)
             return None
         return {"drawer_slot": obj, "downward": {}}
 
+class Inventory(Base):
+    __tablename__ = "inventory"
+
+    id = Column(Integer, primary_key=True)
+    part_id = Column(Integer, ForeignKey("part.id", ondelete="CASCADE"), nullable=False)
+
+    container_id   = Column(Integer, ForeignKey("container.id", ondelete="CASCADE"), nullable=True)
+    shelf_id       = Column(Integer, ForeignKey("shelf.id", ondelete="CASCADE"), nullable=True)
+    drawer_id      = Column(Integer, ForeignKey("drawer.id", ondelete="CASCADE"), nullable=True)
+    drawer_slot_id = Column(Integer, ForeignKey("drawer_slot.id", ondelete="CASCADE"), nullable=True)
+
+    quantity = Column(Integer, nullable=False, default=0)
+    unit = Column(String, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    # Relationships
+    part = relationship("Part", back_populates="inventories")
+    container = relationship("Container", foreign_keys=[container_id], lazy="select")
+    shelf = relationship("Shelf", foreign_keys=[shelf_id], lazy="select")
+    drawer = relationship("Drawer", foreign_keys=[drawer_id], lazy="select")
+    drawer_slot = relationship("DrawerSlot", back_populates="inventories", foreign_keys=[drawer_slot_id], lazy="select")
+
+    __table_args__ = (
+        UniqueConstraint("part_id", "container_id", "shelf_id", "drawer_id", "drawer_slot_id",
+                         name="uq_inventory_part_location"),
+        Index("ix_inventory_container", "container_id"),
+        Index("ix_inventory_shelf", "shelf_id"),
+        Index("ix_inventory_drawer", "drawer_id"),
+        Index("ix_inventory_slot", "drawer_slot_id"),
+    )
+
+    # -------------------------
+    # Adjustments / transfers
+    # -------------------------
+    @classmethod
+    def adjust(cls, session: Session, *, part_id: int,
+               container_id=None, shelf_id=None, drawer_id=None, drawer_slot_id=None,
+               delta: int) -> "Inventory":
+        """Add/remove quantity at a location (positive delta adds, negative removes)."""
+        if delta == 0:
+            raise ValueError("delta must be non-zero.")
+
+        row = session.execute(
+            select(cls).where(
+                cls.part_id == part_id,
+                cls.container_id == container_id,
+                cls.shelf_id == shelf_id,
+                cls.drawer_id == drawer_id,
+                cls.drawer_slot_id == drawer_slot_id,
+            )
+        ).scalar_one_or_none()
+
+        if row:
+            new_qty = (row.quantity or 0) + delta
+            if new_qty < 0:
+                raise ValueError(f"Insufficient stock (have {row.quantity}, need {-delta}).")
+            row.quantity = new_qty
+        else:
+            if delta < 0:
+                raise ValueError("Cannot create inventory with negative quantity.")
+            row = cls(
+                part_id=part_id,
+                container_id=container_id,
+                shelf_id=shelf_id,
+                drawer_id=drawer_id,
+                drawer_slot_id=drawer_slot_id,
+                quantity=delta,
+            )
+            session.add(row)
+
+        try:
+            session.commit()
+            return row
+        except SQLAlchemyError:
+            session.rollback()
+            raise
+
+    @classmethod
+    def transfer(cls, session: Session, *, part_id: int, from_loc: dict, to_loc: dict, qty: int) -> tuple["Inventory", "Inventory"]:
+        """Move qty of a part from one location to another."""
+        if qty <= 0:
+            raise ValueError("qty must be positive.")
+
+        # source
+        src = session.execute(
+            select(cls).where(
+                cls.part_id == part_id,
+                cls.container_id == from_loc.get("container_id"),
+                cls.shelf_id == from_loc.get("shelf_id"),
+                cls.drawer_id == from_loc.get("drawer_id"),
+                cls.drawer_slot_id == from_loc.get("drawer_slot_id"),
+            )
+        ).scalar_one_or_none()
+        if not src or (src.quantity or 0) < qty:
+            have = src.quantity if src else 0
+            raise ValueError(f"Insufficient stock at source (have {have}, need {qty}).")
+        src.quantity -= qty
+
+        # destination
+        dst = session.execute(
+            select(cls).where(
+                cls.part_id == part_id,
+                cls.container_id == to_loc.get("container_id"),
+                cls.shelf_id == to_loc.get("shelf_id"),
+                cls.drawer_id == to_loc.get("drawer_id"),
+                cls.drawer_slot_id == to_loc.get("drawer_slot_id"),
+            )
+        ).scalar_one_or_none()
+        if dst:
+            dst.quantity = (dst.quantity or 0) + qty
+        else:
+            dst = cls(
+                part_id=part_id,
+                container_id=to_loc.get("container_id"),
+                shelf_id=to_loc.get("shelf_id"),
+                drawer_id=to_loc.get("drawer_id"),
+                drawer_slot_id=to_loc.get("drawer_slot_id"),
+                quantity=qty,
+            )
+            session.add(dst)
+
+        try:
+            session.commit()
+            return src, dst
+        except SQLAlchemyError:
+            session.rollback()
+            raise
 
 class Part(Base):
     __tablename__ = "part"
@@ -2095,117 +2292,6 @@ class Part(Base):
 
     def __repr__(self) -> str:
         return f"<Part id={self.id} part_number={self.part_number!r} name={self.name!r}>"
-
-class Inventory(Base):
-    """
-    Stock record: how much of a Part exists at a given drawer slot.
-        Inventory.part_id        -> Part.id
-        Inventory.drawer_slot_id -> DrawerSlot.id
-    """
-    __tablename__ = "inventory"
-
-    id = Column(Integer, primary_key=True)
-    part_id = Column(Integer, ForeignKey("part.id", ondelete="CASCADE"), nullable=False)
-    drawer_slot_id = Column(Integer, ForeignKey("drawer_slot.id", ondelete="CASCADE"), nullable=False)
-    quantity = Column(Integer, nullable=False, default=0)
-
-    part = relationship("Part", back_populates="inventories")
-    drawer_slot = relationship("DrawerSlot", back_populates="inventories")
-
-    __table_args__ = (
-        UniqueConstraint("part_id", "drawer_slot_id", name="uq_inventory_part_slot"),
-        Index("ix_inventory_slot", "drawer_slot_id"),
-    )
-
-    # -------- adjustments / transfers --------
-    @classmethod
-    @with_request_id
-    def adjust(
-        cls,
-        session: Session,
-        *,
-        part_id: int,
-        drawer_slot_id: int,
-        delta: int,
-        request_id=None,
-    ) -> "Inventory":
-        """Add/remove quantity at a slot (positive delta adds, negative removes)."""
-        if delta == 0:
-            raise ValueError("delta must be non-zero.")
-
-        row = session.execute(
-            select(cls).where(cls.part_id == part_id, cls.drawer_slot_id == drawer_slot_id)
-        ).scalar_one_or_none()
-
-        if row:
-            new_qty = (row.quantity or 0) + delta
-            if new_qty < 0:
-                raise ValueError(f"Insufficient stock (have {row.quantity}, need {-delta}).")
-            row.quantity = new_qty
-        else:
-            if delta < 0:
-                raise ValueError("Cannot create inventory with negative quantity.")
-            row = cls(part_id=part_id, drawer_slot_id=drawer_slot_id, quantity=delta)
-            session.add(row)
-
-        try:
-            session.commit()
-            info_id(
-                "Adjusted stock part=%s slot=%s by %s → qty=%s",
-                part_id, drawer_slot_id, delta, row.quantity, request_id=request_id
-            )
-            return row
-        except SQLAlchemyError:
-            session.rollback()
-            error_id("Failed to adjust inventory", exc_info=True, request_id=request_id)
-            raise
-
-    @classmethod
-    @with_request_id
-    def transfer(
-        cls,
-        session: Session,
-        *,
-        part_id: int,
-        from_slot_id: int,
-        to_slot_id: int,
-        qty: int,
-        request_id=None,
-    ) -> tuple["Inventory", "Inventory"]:
-        """Move qty of a part from one slot to another."""
-        if qty <= 0:
-            raise ValueError("qty must be positive.")
-
-        # decrement source
-        src = session.execute(
-            select(cls).where(cls.part_id == part_id, cls.drawer_slot_id == from_slot_id)
-        ).scalar_one_or_none()
-        if not src or (src.quantity or 0) < qty:
-            have = src.quantity if src else 0
-            raise ValueError(f"Insufficient stock at source (have {have}, need {qty}).")
-        src.quantity = src.quantity - qty
-
-        # increment destination
-        dst = session.execute(
-            select(cls).where(cls.part_id == part_id, cls.drawer_slot_id == to_slot_id)
-        ).scalar_one_or_none()
-        if dst:
-            dst.quantity = (dst.quantity or 0) + qty
-        else:
-            dst = cls(part_id=part_id, drawer_slot_id=to_slot_id, quantity=qty)
-            session.add(dst)
-
-        try:
-            session.commit()
-            info_id(
-                "Transferred part=%s qty=%s from slot=%s to slot=%s",
-                part_id, qty, from_slot_id, to_slot_id, request_id=request_id
-            )
-            return src, dst
-        except SQLAlchemyError:
-            session.rollback()
-            error_id("Failed to transfer inventory", exc_info=True, request_id=request_id)
-            raise
 
 class DrawingType(Enum):
     ELECTRICAL = "Electrical"
@@ -3634,48 +3720,6 @@ class Image(Base):
             logger.error(f"Failed to delete image {image_id}: {e}")
             return False
 
-# tool_module.py
-"""
-Comprehensive tool management module for ShopSync database.
-Contains all tool-related models and business logic classes.
-"""
-
-# Standard library
-from typing import Optional, List, Dict, Any, Tuple
-import logging
-
-# SQLAlchemy Core & ORM
-from sqlalchemy import (
-    Column, Integer, String, Text, ForeignKey, Table, Index,
-    UniqueConstraint, and_, or_, func
-)
-from sqlalchemy.orm import relationship, Session, joinedload, selectinload
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-
-# Base class for models
-from app.modules.configuration.base import Base
-
-# Database configuration
-from app.modules.database.db_manager import ShopSyncDatabase
-
-# Logging utilities & decorators
-from app.modules.configuration.log_config import (
-    logger,
-    with_request_id,
-    info_id,
-    debug_id,
-    warning_id,
-    error_id,
-    get_request_id
-)
-
-# Database configuration alias
-DatabaseConfig = ShopSyncDatabase
-
-# ===========================================
-# TOOL ASSOCIATION TABLES
-# ===========================================
-
 tool_package_association = Table(
     'tool_package_association',
     Base.metadata,
@@ -4552,645 +4596,3 @@ class Tool(Base):
         except Exception as e:
             error_id(f"Error getting tools by manufacturer: {e}", rid, exc_info=True)
             return []
-
-
-# ===========================================
-# TOOL MANAGER CLASS (Business Logic)
-# ===========================================
-
-class ToolManager:
-    """
-    Comprehensive tool management class providing search, add, and delete operations.
-    Integrates with existing database configuration and logging system.
-    """
-
-    def __init__(self, db_config: DatabaseConfig = None):
-        """
-        Initialize the ToolManager with database configuration.
-
-        Args:
-            db_config: DatabaseConfig instance for database operations
-        """
-        self.db_config = db_config or DatabaseConfig()
-        self.request_id = get_request_id()
-        logger.info(f"ToolManager initialized with request ID: {self.request_id}")
-
-    # ===================
-    # SEARCH OPERATIONS
-    # ===================
-
-    @with_request_id
-    def search_tools(self,
-                     name: Optional[str] = None,
-                     category_id: Optional[int] = None,
-                     category_name: Optional[str] = None,
-                     manufacturer_id: Optional[int] = None,
-                     manufacturer_name: Optional[str] = None,
-                     tool_type: Optional[str] = None,
-                     material: Optional[str] = None,
-                     size: Optional[str] = None,
-                     description_contains: Optional[str] = None,
-                     include_relationships: bool = True,
-                     limit: Optional[int] = None,
-                     offset: Optional[int] = 0,
-                     request_id: Optional[str] = None) -> List[Tool]:
-        """
-        Search for tools with various filter criteria.
-
-        Args:
-            name: Partial or exact tool name match
-            category_id: Filter by specific category ID
-            category_name: Filter by category name (partial match)
-            manufacturer_id: Filter by specific manufacturer ID
-            manufacturer_name: Filter by manufacturer name (partial match)
-            tool_type: Filter by tool type
-            material: Filter by material
-            size: Filter by size
-            description_contains: Search in description text
-            include_relationships: Whether to eagerly load related data
-            limit: Maximum number of results to return
-            offset: Number of results to skip (for pagination)
-            request_id: Optional request ID for logging
-
-        Returns:
-            List of Tool objects matching the criteria
-        """
-        rid = request_id or get_request_id()
-
-        try:
-            with self.db_config.main_session() as session:
-                # Start with base query
-                query = session.query(Tool)
-
-                # Add eager loading for relationships if requested
-                if include_relationships:
-                    query = query.options(
-                        joinedload(Tool.tool_category),
-                        joinedload(Tool.tool_manufacturer),
-                        selectinload(Tool.tool_packages),
-                        selectinload(Tool.tool_image_association),
-                        selectinload(Tool.tool_position_association)
-                    )
-
-                # Build filter conditions
-                conditions = []
-
-                # Name filter (case-insensitive partial match)
-                if name:
-                    conditions.append(Tool.name.ilike(f'%{name}%'))
-
-                # Category filters
-                if category_id:
-                    conditions.append(Tool.tool_category_id == category_id)
-                elif category_name:
-                    query = query.join(ToolCategory)
-                    conditions.append(ToolCategory.name.ilike(f'%{category_name}%'))
-
-                # Manufacturer filters
-                if manufacturer_id:
-                    conditions.append(Tool.tool_manufacturer_id == manufacturer_id)
-                elif manufacturer_name:
-                    query = query.join(ToolManufacturer)
-                    conditions.append(ToolManufacturer.name.ilike(f'%{manufacturer_name}%'))
-
-                # Type filter
-                if tool_type:
-                    conditions.append(Tool.type.ilike(f'%{tool_type}%'))
-
-                # Material filter
-                if material:
-                    conditions.append(Tool.material.ilike(f'%{material}%'))
-
-                # Size filter
-                if size:
-                    conditions.append(Tool.size.ilike(f'%{size}%'))
-
-                # Description filter
-                if description_contains:
-                    conditions.append(Tool.description.ilike(f'%{description_contains}%'))
-
-                # Apply all conditions
-                if conditions:
-                    query = query.filter(and_(*conditions))
-
-                # Apply pagination
-                if offset:
-                    query = query.offset(offset)
-                if limit:
-                    query = query.limit(limit)
-
-                # Execute query
-                tools = query.all()
-
-                info_id(f"Search found {len(tools)} tools matching criteria", rid)
-                return tools
-
-        except SQLAlchemyError as e:
-            error_id(f"Database error during tool search: {e}", rid, exc_info=True)
-            raise
-        except Exception as e:
-            error_id(f"Unexpected error during tool search: {e}", rid, exc_info=True)
-            raise
-
-    @with_request_id
-    def get_tool_by_id(self, tool_id: int, include_relationships: bool = True, request_id: Optional[str] = None) -> \
-    Optional[Tool]:
-        """
-        Get a specific tool by its ID.
-
-        Args:
-            tool_id: The ID of the tool to retrieve
-            include_relationships: Whether to eagerly load related data
-            request_id: Optional request ID for logging
-
-        Returns:
-            Tool object if found, None otherwise
-        """
-        rid = request_id or get_request_id()
-
-        try:
-            with self.db_config.main_session() as session:
-                return Tool.get_tool_by_id(session, tool_id, include_relationships, request_id=rid)
-
-        except SQLAlchemyError as e:
-            error_id(f"Database error getting tool by ID {tool_id}: {e}", rid, exc_info=True)
-            raise
-        except Exception as e:
-            error_id(f"Unexpected error getting tool by ID {tool_id}: {e}", rid, exc_info=True)
-            raise
-
-    @with_request_id
-    def search_tools_full_text(self, search_term: str, limit: Optional[int] = 50, request_id: Optional[str] = None) -> \
-    List[Tool]:
-        """
-        Perform full-text search across tool name, type, material, and description.
-
-        Args:
-            search_term: Text to search for
-            limit: Maximum number of results
-            request_id: Optional request ID for logging
-
-        Returns:
-            List of Tool objects matching the search term
-        """
-        rid = request_id or get_request_id()
-
-        try:
-            with self.db_config.main_session() as session:
-                # Create a comprehensive text search across multiple fields
-                search_pattern = f'%{search_term}%'
-
-                query = session.query(Tool).options(
-                    joinedload(Tool.tool_category),
-                    joinedload(Tool.tool_manufacturer)
-                ).filter(
-                    or_(
-                        Tool.name.ilike(search_pattern),
-                        Tool.type.ilike(search_pattern),
-                        Tool.material.ilike(search_pattern),
-                        Tool.description.ilike(search_pattern)
-                    )
-                )
-
-                if limit:
-                    query = query.limit(limit)
-
-                tools = query.all()
-                info_id(f"Full-text search for '{search_term}' found {len(tools)} tools", rid)
-                return tools
-
-        except SQLAlchemyError as e:
-            error_id(f"Database error during full-text search: {e}", rid, exc_info=True)
-            raise
-        except Exception as e:
-            error_id(f"Unexpected error during full-text search: {e}", rid, exc_info=True)
-            raise
-
-    @with_request_id
-    def get_tools_by_category(self, category_id: int, include_subcategories: bool = True,
-                              request_id: Optional[str] = None) -> List[Tool]:
-        """
-        Get all tools in a specific category.
-
-        Args:
-            category_id: The category ID
-            include_subcategories: Whether to include tools from subcategories
-            request_id: Optional request ID for logging
-
-        Returns:
-            List of tools in the category
-        """
-        rid = request_id or get_request_id()
-
-        try:
-            with self.db_config.main_session() as session:
-                return Tool.get_tools_by_category(session, category_id, include_subcategories, request_id=rid)
-
-        except SQLAlchemyError as e:
-            error_id(f"Database error getting tools by category: {e}", rid, exc_info=True)
-            raise
-        except Exception as e:
-            error_id(f"Unexpected error getting tools by category: {e}", rid, exc_info=True)
-            raise
-
-    # ===================
-    # ADD OPERATIONS
-    # ===================
-
-    @with_request_id
-    def add_tool(self,
-                 name: str,
-                 tool_category_id: int,
-                 tool_manufacturer_id: int,
-                 size: Optional[str] = None,
-                 tool_type: Optional[str] = None,
-                 material: Optional[str] = None,
-                 description: Optional[str] = None,
-                 package_ids: Optional[List[int]] = None,
-                 request_id: Optional[str] = None) -> Optional[Tool]:
-        """
-        Add a new tool to the database.
-
-        Args:
-            name: Tool name
-            tool_category_id: Category ID (must exist)
-            tool_manufacturer_id: Manufacturer ID (must exist)
-            size: Tool size specification
-            tool_type: Type of tool
-            material: Material composition
-            description: Detailed description
-            package_ids: List of package IDs to associate with this tool
-            request_id: Optional request ID for logging
-
-        Returns:
-            The created Tool object or None if failed
-
-        Raises:
-            ValueError: If required references don't exist
-            IntegrityError: If database constraints are violated
-        """
-        rid = request_id or get_request_id()
-
-        try:
-            with self.db_config.main_session() as session:
-                tool = Tool.add_tool(
-                    session=session,
-                    name=name,
-                    tool_category_id=tool_category_id,
-                    tool_manufacturer_id=tool_manufacturer_id,
-                    size=size,
-                    tool_type=tool_type,
-                    material=material,
-                    description=description,
-                    request_id=rid
-                )
-
-                # Add package associations if provided
-                if tool and package_ids:
-                    self._add_tool_package_associations(session, tool.id, package_ids, rid)
-                    session.commit()
-
-                return tool
-
-        except ValueError as e:
-            error_id(f"Validation error creating tool: {e}", rid, exc_info=True)
-            raise
-        except IntegrityError as e:
-            error_id(f"Database integrity error creating tool: {e}", rid, exc_info=True)
-            raise
-        except SQLAlchemyError as e:
-            error_id(f"Database error creating tool: {e}", rid, exc_info=True)
-            raise
-        except Exception as e:
-            error_id(f"Unexpected error creating tool: {e}", rid, exc_info=True)
-            raise
-
-    @with_request_id
-    def add_tool_from_dict(self, tool_data: Dict[str, Any], request_id: Optional[str] = None) -> Optional[Tool]:
-        """
-        Add a tool from a dictionary of data.
-
-        Args:
-            tool_data: Dictionary containing tool information
-            request_id: Optional request ID for logging
-
-        Returns:
-            The created Tool object
-        """
-        rid = request_id or get_request_id()
-
-        required_fields = ['name', 'tool_category_id', 'tool_manufacturer_id']
-
-        # Validate required fields
-        for field in required_fields:
-            if field not in tool_data:
-                raise ValueError(f"Required field '{field}' is missing from tool data")
-
-        return self.add_tool(
-            name=tool_data['name'],
-            tool_category_id=tool_data['tool_category_id'],
-            tool_manufacturer_id=tool_data['tool_manufacturer_id'],
-            size=tool_data.get('size'),
-            tool_type=tool_data.get('type'),
-            material=tool_data.get('material'),
-            description=tool_data.get('description'),
-            package_ids=tool_data.get('package_ids'),
-            request_id=rid
-        )
-
-    # ===================
-    # UPDATE OPERATIONS
-    # ===================
-
-    @with_request_id
-    def update_tool(self,
-                    tool_id: int,
-                    name: Optional[str] = None,
-                    size: Optional[str] = None,
-                    tool_type: Optional[str] = None,
-                    material: Optional[str] = None,
-                    description: Optional[str] = None,
-                    tool_category_id: Optional[int] = None,
-                    tool_manufacturer_id: Optional[int] = None,
-                    package_ids: Optional[List[int]] = None,
-                    request_id: Optional[str] = None) -> Optional[Tool]:
-        """
-        Update an existing tool.
-
-        Args:
-            tool_id: ID of the tool to update
-            name: New name (if provided)
-            size: New size (if provided)
-            tool_type: New type (if provided)
-            material: New material (if provided)
-            description: New description (if provided)
-            tool_category_id: New category ID (if provided)
-            tool_manufacturer_id: New manufacturer ID (if provided)
-            package_ids: New list of package IDs (replaces existing associations)
-            request_id: Optional request ID for logging
-
-        Returns:
-            Updated Tool object if successful, None if tool not found
-        """
-        rid = request_id or get_request_id()
-
-        try:
-            with self.db_config.main_session() as session:
-                # Prepare update data
-                update_data = {}
-                if name is not None:
-                    update_data['name'] = name
-                if size is not None:
-                    update_data['size'] = size
-                if tool_type is not None:
-                    update_data['type'] = tool_type
-                if material is not None:
-                    update_data['material'] = material
-                if description is not None:
-                    update_data['description'] = description
-                if tool_category_id is not None:
-                    update_data['tool_category_id'] = tool_category_id
-                if tool_manufacturer_id is not None:
-                    update_data['tool_manufacturer_id'] = tool_manufacturer_id
-
-                # Update the tool
-                tool = Tool.update_tool(session, tool_id, request_id=rid, **update_data)
-
-                # Update package associations if provided
-                if tool and package_ids is not None:
-                    # Remove existing associations
-                    session.execute(
-                        tool_package_association.delete().where(
-                            tool_package_association.c.tool_id == tool_id
-                        )
-                    )
-                    # Add new associations
-                    if package_ids:
-                        self._add_tool_package_associations(session, tool_id, package_ids, rid)
-                    session.commit()
-
-                return tool
-
-        except ValueError as e:
-            error_id(f"Validation error updating tool: {e}", rid, exc_info=True)
-            raise
-        except SQLAlchemyError as e:
-            error_id(f"Database error updating tool: {e}", rid, exc_info=True)
-            raise
-        except Exception as e:
-            error_id(f"Unexpected error updating tool: {e}", rid, exc_info=True)
-            raise
-
-    # ===================
-    # DELETE OPERATIONS
-    # ===================
-
-    @with_request_id
-    def delete_tool(self, tool_id: int, force: bool = False, request_id: Optional[str] = None) -> bool:
-        """
-        Delete a tool from the database.
-
-        Args:
-            tool_id: ID of the tool to delete
-            force: If True, will delete even if tool has dependencies
-            request_id: Optional request ID for logging
-
-        Returns:
-            True if deletion was successful, False if tool not found
-
-        Raises:
-            ValueError: If tool has dependencies and force=False
-        """
-        rid = request_id or get_request_id()
-
-        try:
-            with self.db_config.main_session() as session:
-                return Tool.delete_tool(session, tool_id, force, request_id=rid)
-
-        except ValueError as e:
-            error_id(f"Validation error deleting tool: {e}", rid, exc_info=True)
-            raise
-        except SQLAlchemyError as e:
-            error_id(f"Database error deleting tool: {e}", rid, exc_info=True)
-            raise
-        except Exception as e:
-            error_id(f"Unexpected error deleting tool: {e}", rid, exc_info=True)
-            raise
-
-    @with_request_id
-    def delete_tools_by_category(self, category_id: int, force: bool = False, request_id: Optional[str] = None) -> int:
-        """
-        Delete all tools in a specific category.
-
-        Args:
-            category_id: Category ID
-            force: If True, will delete even if tools have dependencies
-            request_id: Optional request ID for logging
-
-        Returns:
-            Number of tools deleted
-        """
-        rid = request_id or get_request_id()
-
-        try:
-            tools = self.get_tools_by_category(category_id, include_subcategories=False, request_id=rid)
-            deleted_count = 0
-
-            for tool in tools:
-                if self.delete_tool(tool.id, force=force, request_id=rid):
-                    deleted_count += 1
-
-            info_id(f"Deleted {deleted_count} tools from category {category_id}", rid)
-            return deleted_count
-
-        except Exception as e:
-            error_id(f"Error deleting tools by category: {e}", rid, exc_info=True)
-            raise
-
-    @with_request_id
-    def delete_tools_by_manufacturer(self, manufacturer_id: int, force: bool = False,
-                                     request_id: Optional[str] = None) -> int:
-        """
-        Delete all tools from a specific manufacturer.
-
-        Args:
-            manufacturer_id: Manufacturer ID
-            force: If True, will delete even if tools have dependencies
-            request_id: Optional request ID for logging
-
-        Returns:
-            Number of tools deleted
-        """
-        rid = request_id or get_request_id()
-
-        try:
-            with self.db_config.main_session() as session:
-                tools = Tool.get_tools_by_manufacturer(session, manufacturer_id, request_id=rid)
-
-                deleted_count = 0
-                for tool in tools:
-                    if self.delete_tool(tool.id, force=force, request_id=rid):
-                        deleted_count += 1
-
-                info_id(f"Deleted {deleted_count} tools from manufacturer {manufacturer_id}", rid)
-                return deleted_count
-
-        except Exception as e:
-            error_id(f"Error deleting tools by manufacturer: {e}", rid, exc_info=True)
-            raise
-
-    # ===================
-    # UTILITY METHODS
-    # ===================
-
-    def _add_tool_package_associations(self, session, tool_id: int, package_ids: List[int], request_id: str):
-        """Add tool-package associations."""
-        for package_id in package_ids:
-            # Validate package exists
-            package = session.query(ToolPackage).filter(ToolPackage.id == package_id).first()
-            if not package:
-                raise ValueError(f"Tool package with ID {package_id} does not exist")
-
-            # Add association
-            association = tool_package_association.insert().values(
-                tool_id=tool_id,
-                package_id=package_id,
-                quantity=1  # Default quantity
-            )
-            session.execute(association)
-
-    def _check_tool_dependencies(self, session, tool_id: int, request_id: str) -> List[str]:
-        """Check if a tool has dependencies that would prevent deletion."""
-        dependencies = []
-
-        # Check tool packages
-        package_count = session.query(func.count()).select_from(
-            tool_package_association
-        ).filter(tool_package_association.c.tool_id == tool_id).scalar()
-        if package_count > 0:
-            dependencies.append(f"{package_count} package associations")
-
-        # Check tool images
-        image_count = session.query(ToolImageAssociation).filter(
-            ToolImageAssociation.tool_id == tool_id
-        ).count()
-        if image_count > 0:
-            dependencies.append(f"{image_count} image associations")
-
-        # Check tool positions
-        position_count = session.query(ToolPositionAssociation).filter(
-            ToolPositionAssociation.tool_id == tool_id
-        ).count()
-        if position_count > 0:
-            dependencies.append(f"{position_count} position associations")
-
-        return dependencies
-
-    # ===================
-    # STATISTICS AND REPORTING
-    # ===================
-
-    @with_request_id
-    def get_tool_statistics(self, request_id: Optional[str] = None) -> Dict[str, Any]:
-        """Get comprehensive statistics about tools in the database."""
-        rid = request_id or get_request_id()
-
-        try:
-            with self.db_config.main_session() as session:
-                stats = {}
-
-                # Total tool count
-                stats['total_tools'] = session.query(Tool).count()
-
-                # Tools by category
-                category_stats = session.query(
-                    ToolCategory.name,
-                    func.count(Tool.id).label('count')
-                ).join(Tool).group_by(ToolCategory.name).all()
-                stats['tools_by_category'] = {name: count for name, count in category_stats}
-
-                # Tools by manufacturer
-                manufacturer_stats = session.query(
-                    ToolManufacturer.name,
-                    func.count(Tool.id).label('count')
-                ).join(Tool).group_by(ToolManufacturer.name).all()
-                stats['tools_by_manufacturer'] = {name: count for name, count in manufacturer_stats}
-
-                # Tools by type
-                type_stats = session.query(
-                    Tool.type,
-                    func.count(Tool.id).label('count')
-                ).filter(Tool.type.isnot(None)).group_by(Tool.type).all()
-                stats['tools_by_type'] = {tool_type or 'Unknown': count for tool_type, count in type_stats}
-
-                # Tools by material
-                material_stats = session.query(
-                    Tool.material,
-                    func.count(Tool.id).label('count')
-                ).filter(Tool.material.isnot(None)).group_by(Tool.material).all()
-                stats['tools_by_material'] = {material or 'Unknown': count for material, count in material_stats}
-
-                info_id(f"Generated tool statistics: {stats['total_tools']} total tools", rid)
-                return stats
-
-        except SQLAlchemyError as e:
-            error_id(f"Database error generating tool statistics: {e}", rid, exc_info=True)
-            raise
-        except Exception as e:
-            error_id(f"Unexpected error generating tool statistics: {e}", rid, exc_info=True)
-            raise
-
-
-# ===========================================
-# CONVENIENCE FUNCTIONS
-# ===========================================
-
-def create_tool_manager(db_config: DatabaseConfig = None) -> ToolManager:
-    """Create a new ToolManager instance."""
-    return ToolManager(db_config)
-
-
-def get_default_tool_manager() -> ToolManager:
-    """Get a default ToolManager instance with standard database config."""
-    return ToolManager(DatabaseConfig())
-
