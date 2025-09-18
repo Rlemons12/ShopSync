@@ -2190,6 +2190,79 @@ class Inventory(Base):
             session.rollback()
             raise
 
+    @classmethod
+    def fetch_inventory_rows(cls, session: Session, limit: int = 500) -> list[tuple]:
+        """
+        Fetch inventory rows for UI table.
+        Always returns 8 values per row:
+          (id, part_name, part_type, location, quantity, unit, updated_str, updated_ts)
+        """
+        q = (
+            session.query(cls)
+            .options(
+                joinedload(cls.part),
+                joinedload(cls.container).joinedload(Container.position).joinedload(Position.site_location),
+                joinedload(cls.shelf).joinedload(Shelf.container).joinedload(Container.position).joinedload(
+                    Position.site_location),
+                joinedload(cls.drawer).joinedload(Drawer.shelf).joinedload(Shelf.container).joinedload(
+                    Container.position).joinedload(Position.site_location),
+                joinedload(cls.drawer_slot).joinedload(DrawerSlot.drawer).joinedload(Drawer.shelf)
+                .joinedload(Shelf.container).joinedload(Container.position).joinedload(Position.site_location),
+            )
+            .order_by(cls.id.desc())
+            .limit(limit)
+        )
+
+        rows = []
+        for inv in q.all():
+            # ---- Core safe lookups ----
+            id_ = inv.id
+            part_name = getattr(inv.part, "name", "") or ""
+            part_type = getattr(inv.part, "model", "") or ""
+            qty = int(inv.quantity or 0)
+            unit = inv.unit or ""
+
+            # Updated timestamps
+            if inv.updated_at:
+                updated_str = inv.updated_at.strftime("%Y-%m-%d %H:%M")
+                updated_ts = inv.updated_at.timestamp()
+            else:
+                updated_str, updated_ts = "", 0
+
+            # Resolve location string (safe)
+            try:
+                loc_parts = []
+                if inv.container and inv.container.position and inv.container.position.site_location:
+                    loc_parts.append(inv.container.position.site_location.title or "")
+                if inv.container:
+                    loc_parts.append(inv.container.title or "")
+                if inv.shelf:
+                    loc_parts.append(inv.shelf.title or "")
+                if inv.drawer:
+                    loc_parts.append(inv.drawer.title or "")
+                if inv.drawer_slot:
+                    loc_parts.append(inv.drawer_slot.title or "")
+                location = " / ".join([p for p in loc_parts if p]) or "(unassigned)"
+            except Exception:
+                location = "(error resolving location)"
+
+            # ---- Always append 8-tuple ----
+            rows.append(
+                (
+                    id_,
+                    part_name,
+                    part_type,
+                    location,
+                    qty,
+                    unit,
+                    updated_str,
+                    updated_ts,
+                )
+            )
+
+        return rows
+
+
 class Part(Base):
     __tablename__ = "part"
 

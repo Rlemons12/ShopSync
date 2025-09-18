@@ -13,6 +13,50 @@ import functools
 from typing import Optional
 from pathlib import Path
 
+# CRASH DEBUGGING - Enable fault handler for better crash diagnostics
+# ================================================================
+import faulthandler
+import signal
+
+
+def setup_crash_debugging():
+    """
+    Enable comprehensive crash debugging for segfaults and other fatal errors.
+    This is especially useful when working with C extensions or numerical libraries.
+    """
+    try:
+        # Enable basic fault handler - dumps traceback on segfault
+        faulthandler.enable(all_threads=True)
+
+        # Register fault handler for specific crash signals
+        crash_signals = [
+            (signal.SIGSEGV, "Segmentation fault"),
+            (signal.SIGABRT, "Abort signal"),
+            (signal.SIGFPE, "Floating point exception"),
+            (signal.SIGILL, "Illegal instruction")
+        ]
+
+        registered_signals = []
+        for sig, description in crash_signals:
+            try:
+                faulthandler.register(sig, file=sys.__stderr__, all_threads=True)
+                registered_signals.append(description)
+            except Exception as e:
+                # Some signals might not be available on all platforms (e.g., Windows)
+                print(f"[faulthandler] Could not register {description} ({sig}): {e}")
+
+        if registered_signals:
+            print(f"[faulthandler] Crash debugging enabled for: {', '.join(registered_signals)}")
+        else:
+            print("[faulthandler] Basic crash debugging enabled")
+
+    except Exception as e:
+        print(f"[faulthandler] Failed to setup crash debugging: {e}")
+
+
+# Initialize crash debugging early
+setup_crash_debugging()
+
 # Determine the root directory based on whether the code is frozen (e.g., PyInstaller .exe)
 if getattr(sys, 'frozen', False):  # Running as an executable
     BASE_DIR = os.path.dirname(sys.executable)
@@ -74,6 +118,70 @@ if not logger.handlers:
 # Optionally, prevent log messages from being propagated to the root logger
 logger.propagate = False
 
+
+# LOG CRASH/EXCEPTION CONTEXT
+# ===========================
+
+def log_crash_context(request_id=None):
+    """
+    Log additional context when a crash or unhandled exception occurs.
+    This complements the faulthandler output with application-specific info.
+    """
+    try:
+        req_id = request_id or get_request_id()
+        error_id(f"CRASH CONTEXT - Request ID: {req_id}", req_id)
+        error_id(f"CRASH CONTEXT - Python version: {sys.version}", req_id)
+        error_id(f"CRASH CONTEXT - Platform: {sys.platform}", req_id)
+        error_id(f"CRASH CONTEXT - Working directory: {os.getcwd()}", req_id)
+        error_id(f"CRASH CONTEXT - Thread count: {threading.active_count()}", req_id)
+
+        # Log active thread info
+        for thread in threading.enumerate():
+            error_id(f"CRASH CONTEXT - Active thread: {thread.name} (alive: {thread.is_alive()})", req_id)
+
+    except Exception as e:
+        try:
+            # Fallback logging if our custom logging fails
+            print(f"[CRITICAL] Failed to log crash context: {e}")
+        except:
+            pass
+
+
+def handle_unhandled_exception(exc_type, exc_value, exc_traceback):
+    """
+    Custom exception handler that logs unhandled exceptions with context.
+    This works alongside faulthandler for comprehensive crash reporting.
+    """
+    if issubclass(exc_type, KeyboardInterrupt):
+        # Don't log KeyboardInterrupt as an error
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    try:
+        req_id = get_request_id()
+        critical_id(f"UNHANDLED EXCEPTION: {exc_type.__name__}: {exc_value}", req_id)
+
+        # Log the full traceback
+        import traceback
+        tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+        for line in tb_lines:
+            error_id(f"TRACEBACK: {line.rstrip()}", req_id)
+
+        # Log crash context
+        log_crash_context(req_id)
+
+    except Exception as logging_error:
+        # If our logging fails, fall back to standard behavior
+        print(f"[CRITICAL] Failed to log unhandled exception: {logging_error}")
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+    # Always call the default handler as backup
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+
+# Install the custom exception handler
+sys.excepthook = handle_unhandled_exception
+
 # UUID-BASED REQUEST/SESSION TRACKING
 # ==================================
 
@@ -85,6 +193,7 @@ def with_request_id(func):
     """
     Decorator that adds request/session ID tracking to a function.
     Creates a new ID if one doesn't exist.
+    Enhanced with crash context logging on exceptions.
     """
 
     @functools.wraps(func)
@@ -101,6 +210,11 @@ def with_request_id(func):
         except Exception as e:
             end_time = time.time()
             error_id(f"Error in {func.__name__} after {end_time - start_time:.3f}s: {e}", request_id)
+
+            # Log crash context for serious exceptions
+            if isinstance(e, (MemoryError, SystemError, OSError)):
+                log_crash_context(request_id)
+
             raise
 
     return wrapper
@@ -162,7 +276,7 @@ def log_with_id(level, message, request_id=None, *args, **kwargs):
             # String contains characters that can't be encoded - make it safe
             import unicodedata
 
-            # Method 1: Remove combining characters (like Ìˆ)
+            # Method 1: Remove combining characters (like ÃŒË†)
             normalized = unicodedata.normalize('NFD', final)
             without_combining = ''.join(c for c in normalized if unicodedata.category(c) != 'Mn')
 
@@ -247,6 +361,10 @@ def log_timed_operation(operation_name, request_id=None):
             if exc_type:
                 error_id(f"Operation {self.operation_name} failed after {duration:.3f}s: {str(exc_val)}",
                          self.request_id)
+
+                # Log crash context for serious exceptions
+                if isinstance(exc_val, (MemoryError, SystemError, OSError)):
+                    log_crash_context(self.request_id)
             else:
                 debug_id(f"Operation {self.operation_name} completed in {duration:.3f}s",
                          self.request_id)
@@ -465,3 +583,8 @@ class TrainingLogManager:
 
     def __exit__(self, exc_type, exc, tb):
         self.close()
+
+
+# STARTUP LOG MESSAGE
+# ==================
+info_id("ShopSync logging system initialized with crash debugging enabled")
