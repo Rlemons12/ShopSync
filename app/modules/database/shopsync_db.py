@@ -31,10 +31,13 @@ from app.modules.configuration.log_config import (
 )
 
 
+from sqlalchemy import Column, Integer, String, ForeignKey
+from sqlalchemy.orm import relationship
+from modules.configuration.log_config import info_id, error_id, debug_id, with_request_id
 
-
-
-
+# ---------------------------------------------------------------------
+# CAMPUS CLASS
+# ---------------------------------------------------------------------
 class Campus(Base):
     """A campus/site that contains buildings."""
     __tablename__ = 'campus'
@@ -46,7 +49,7 @@ class Campus(Base):
     state       = Column(String)
     country     = Column(String)
 
-    # One campus -> many buildings
+    # Relationships
     buildings = relationship(
         "Building",
         back_populates="campus",
@@ -54,7 +57,6 @@ class Campus(Base):
         passive_deletes=True,
     )
 
-    # One campus -> many positions (optional but required if Position.campus uses back_populates)
     positions = relationship(
         "Position",
         back_populates="campus",
@@ -65,7 +67,75 @@ class Campus(Base):
     def __repr__(self):
         return f"<Campus id={self.id} name={self.name!r}>"
 
+    # ---------------- Convenience Methods ----------------
 
+    @classmethod
+    @with_request_id
+    def add_campus(cls, session, name, description=None, city=None, state=None, country=None, request_id=None):
+        """Add a new campus to the database."""
+        new_campus = cls(
+            name=name,
+            description=description,
+            city=city,
+            state=state,
+            country=country
+        )
+        session.add(new_campus)
+        session.commit()
+        info_id(f"Created new campus: '{name}' ({city}, {state})", request_id)
+        return new_campus
+
+    @classmethod
+    @with_request_id
+    def delete_campus(cls, session, campus_id, request_id=None):
+        """Delete a campus by ID."""
+        campus = session.query(cls).filter(cls.id == campus_id).first()
+        if campus:
+            session.delete(campus)
+            session.commit()
+            info_id(f"Deleted campus ID {campus_id}", request_id)
+            return True
+        else:
+            error_id(f"Campus ID {campus_id} not found", request_id)
+            return False
+
+    @classmethod
+    @with_request_id
+    def find_or_create(cls, session, name, description=None, city=None, state=None, country=None, request_id=None):
+        """Find or create a Campus by name."""
+        campus = session.query(cls).filter_by(name=name).first()
+        if campus:
+            debug_id(f"Found existing campus '{name}'", request_id)
+        else:
+            campus = cls(
+                name=name,
+                description=description,
+                city=city,
+                state=state,
+                country=country
+            )
+            session.add(campus)
+            session.commit()
+            info_id(f"Created new campus '{name}'", request_id)
+        return campus
+
+    @classmethod
+    @with_request_id
+    def find_related_entities(cls, session, identifier, is_id=True, request_id=None):
+        """Return campus details and related buildings."""
+        campus = session.query(cls).filter(cls.id == identifier if is_id else cls.name == identifier).first()
+        if not campus:
+            error_id(f"Campus not found for {identifier}", request_id)
+            return None
+
+        downward = {"buildings": campus.buildings, "positions": campus.positions}
+        info_id(f"Found related entities for campus ID {campus.id}", request_id)
+        return {"campus": campus, "downward": downward}
+
+
+# ---------------------------------------------------------------------
+# BUILDING CLASS
+# ---------------------------------------------------------------------
 class Building(Base):
     """A building that belongs to a campus."""
     __tablename__ = 'building'
@@ -75,13 +145,11 @@ class Building(Base):
     description = Column(String)
     address     = Column(String)
 
-    campus_id = Column(Integer, ForeignKey('campus.id', ondelete="CASCADE"),
-                       nullable=False, index=True)
+    campus_id = Column(Integer, ForeignKey('campus.id', ondelete="CASCADE"), nullable=False, index=True)
 
-    # Many buildings -> one campus
+    # Relationships
     campus = relationship("Campus", back_populates="buildings")
 
-    # One building -> many site locations
     site_locations = relationship(
         "SiteLocation",
         back_populates="building",
@@ -89,7 +157,6 @@ class Building(Base):
         passive_deletes=True,
     )
 
-    # One building -> many positions
     positions = relationship(
         "Position",
         back_populates="building",
@@ -99,6 +166,69 @@ class Building(Base):
 
     def __repr__(self):
         return f"<Building id={self.id} name={self.name!r} campus_id={self.campus_id}>"
+
+    # ---------------- Convenience Methods ----------------
+
+    @classmethod
+    @with_request_id
+    def add_building(cls, session, name, campus_id, description=None, address=None, request_id=None):
+        """Add a new building linked to a campus."""
+        new_building = cls(
+            name=name,
+            description=description,
+            address=address,
+            campus_id=campus_id
+        )
+        session.add(new_building)
+        session.commit()
+        info_id(f"Created new building '{name}' (Campus ID {campus_id})", request_id)
+        return new_building
+
+    @classmethod
+    @with_request_id
+    def delete_building(cls, session, building_id, request_id=None):
+        """Delete a building by ID."""
+        building = session.query(cls).filter(cls.id == building_id).first()
+        if building:
+            session.delete(building)
+            session.commit()
+            info_id(f"Deleted building ID {building_id}", request_id)
+            return True
+        else:
+            error_id(f"Building ID {building_id} not found", request_id)
+            return False
+
+    @classmethod
+    @with_request_id
+    def find_or_create(cls, session, name, campus_id, description=None, address=None, request_id=None):
+        """Find or create a Building by name and campus."""
+        building = session.query(cls).filter_by(name=name, campus_id=campus_id).first()
+        if building:
+            debug_id(f"Found existing building '{name}' under Campus {campus_id}", request_id)
+        else:
+            building = cls(
+                name=name,
+                description=description,
+                address=address,
+                campus_id=campus_id
+            )
+            session.add(building)
+            session.commit()
+            info_id(f"Created new building '{name}' (Campus {campus_id})", request_id)
+        return building
+
+    @classmethod
+    @with_request_id
+    def find_related_entities(cls, session, identifier, is_id=True, request_id=None):
+        """Return building details and related entities."""
+        building = session.query(cls).filter(cls.id == identifier if is_id else cls.name == identifier).first()
+        if not building:
+            error_id(f"Building not found for {identifier}", request_id)
+            return None
+
+        downward = {"site_locations": building.site_locations, "positions": building.positions}
+        info_id(f"Found related entities for building ID {building.id}", request_id)
+        return {"building": building, "downward": downward}
 
 
 class SiteLocation(Base):
@@ -122,9 +252,130 @@ class SiteLocation(Base):
         passive_deletes=True,
     )
 
-    # (Your classmethods can stay as-is, but if you referenced `site_location.position`,
-    # update to `site_location.positions` since it's a collection.)
+    @classmethod
+    @with_request_id
+    def add_site_location(cls, session, title, room_number, site_area, request_id=None):
+        """
+        Add a new site location to the database.
 
+        Args:
+            session: SQLAlchemy database session
+            title (str): Title of the site location
+            room_number (str): Room number of the site location
+            site_area (str): Site area of the site location
+            request_id (str, optional): Unique identifier for the request
+
+        Returns:
+            SiteLocation: The newly created site location object
+        """
+        new_site_location = cls(
+            title=title,
+            room_number=room_number,
+            site_area=site_area
+        )
+
+        session.add(new_site_location)
+        session.commit()
+
+        logger.info(f"Created new site location: '{title}' in room {room_number}, area {site_area}")
+        return new_site_location
+
+    @classmethod
+    @with_request_id
+    def delete_site_location(cls, session, site_location_id, request_id=None):
+        """
+        Delete a site location from the database.
+
+        Args:
+            session: SQLAlchemy database session
+            site_location_id (int): ID of the site location to delete
+            request_id (str, optional): Unique identifier for the request
+
+        Returns:
+            bool: True if deletion was successful, False if site location not found
+        """
+        site_location = session.query(cls).filter(cls.id == site_location_id).first()
+
+        if site_location:
+            session.delete(site_location)
+            session.commit()
+            logger.info(f"Deleted site location ID {site_location_id}")
+            return True
+        else:
+            logger.warning(f"Failed to delete site location ID {site_location_id} - not found")
+            return False
+
+    @classmethod
+    @with_request_id
+    def find_related_entities(cls, session, identifier, is_id=True, request_id=None):
+        """
+        Find all related entities for a site location.
+
+        Args:
+            session: SQLAlchemy database session
+            identifier: Either site location ID (int) or title (str)
+            is_id (bool): If True, identifier is an ID, otherwise it's a title
+            request_id (str, optional): Unique identifier for the request
+
+        Returns:
+            dict: Dictionary containing:
+                - 'site_location': The found site location object
+                - 'downward': Dictionary containing:
+                    - 'positions': List of all positions at this site location
+        """
+        # Find the site location
+        if is_id:
+            site_location = session.query(cls).filter(cls.id == identifier).first()
+        else:
+            site_location = session.query(cls).filter(cls.title == identifier).first()
+
+        if not site_location:
+            logger.warning(f"Site location not found for identifier: {identifier}")
+            return None
+
+        # Going downward in the hierarchy
+        downward = {
+            'positions': site_location.position
+        }
+
+        logger.info(f"Found related entities for site location ID {site_location.id}")
+        return {
+            'site_location': site_location,
+            'downward': downward
+        }
+
+    @classmethod
+    @with_request_id
+    def find_or_create(cls, session, title, room_number="Unknown", site_area="General", request_id=None):
+        """
+        Find a SiteLocation by title, or create it if it doesn't exist.
+
+        Args:
+            session: SQLAlchemy database session
+            title (str): Title of the site location
+            room_number (str): Room number (default "Unknown")
+            site_area (str): Site area (default "General")
+            request_id (str, optional): Unique identifier for the request
+
+        Returns:
+            SiteLocation: The found or newly created site location object
+        """
+        site_location = session.query(cls).filter_by(title=title).first()
+
+        if site_location:
+            logger.info(f"Found existing site location '{title}'", extra={'request_id': request_id})
+        else:
+            site_location = cls(
+                title=title,
+                room_number=room_number,
+                site_area=site_area
+            )
+            session.add(site_location)
+            session.commit()
+            logger.info(f"Created new site location '{title}' with room '{room_number}' and area '{site_area}'",
+                        extra={'request_id': request_id})
+
+        return site_location
 
 class Position(Base):
     __tablename__ = 'position'
@@ -1517,43 +1768,21 @@ class StorageAddress(Base):
     drawer_id     = Column(Integer, ForeignKey("drawer.id"), nullable=True)
     slot_id       = Column(Integer, ForeignKey("drawer_slot.id"), nullable=True)
 
-    path        = Column(String, nullable=False)   # e.g. "DT3-ST-01-D02-R01C01"
+    path        = Column(String, nullable=False)   # e.g. "CA-01-ENG-0007-SH01-DR01-SL01"
     short_label = Column(String, nullable=True)
     depth       = Column(Integer, nullable=False, default=0)
     is_active   = Column(Integer, default=1)
 
-    # ----------------------------------------------------------
-    # Small helpers
-    # ----------------------------------------------------------
+    # -------------------------------------------
+    # Helper to normalize
+    # -------------------------------------------
     @staticmethod
     def _tok(s: str | None) -> str:
         return (s or "").strip().upper().replace(" ", "-")
 
-    @staticmethod
-    def _slice_area(area_name: str | None, start_1_based=3, length=2) -> str:
-        if not area_name:
-            return ""
-        s = max(0, start_1_based - 1)
-        return area_name[s:s+length]
-
-    @staticmethod
-    def _prefix_from_position(session: Session, position_id: int) -> str:
-        from app.modules.database.shopsync_db import Position
-        pos = session.get(Position, position_id)
-        if not pos:
-            return "POS"
-
-        campus_tok   = StorageAddress._tok(getattr(getattr(pos, "campus", None), "name", None) or "C")
-        building_tok = StorageAddress._tok(getattr(getattr(pos, "building", None), "name", None) or "B")
-        area_src     = getattr(getattr(pos, "site_location", None), "site_area", None) or "AREA"
-        area_tok     = StorageAddress._slice_area(StorageAddress._tok(area_src), 3, 2) or "XX"
-
-        building_num = re.sub(r"[^0-9]", "", building_tok) or building_tok
-        return f"{campus_tok}{building_num}-{area_tok}"
-
-    # ----------------------------------------------------------
-    # Upserts rewritten to accept ORM objects
-    # ----------------------------------------------------------
+    # -------------------------------------------
+    # Upserts rewritten to use unified name fields
+    # -------------------------------------------
     @classmethod
     @with_request_id
     def upsert_for_container(cls, session: Session, container, request_id=None):
@@ -1563,9 +1792,7 @@ class StorageAddress(Base):
         if not container:
             raise ValueError("Container not found")
 
-        prefix = cls._prefix_from_position(session, container.position_id)
-        path = f"{prefix}-{container.id:02d}"
-
+        path = container.name  # directly use unified name
         addr = session.execute(
             select(cls).where(cls.entity_type == "container", cls.entity_id == container.id)
         ).scalar_one_or_none()
@@ -1582,15 +1809,15 @@ class StorageAddress(Base):
             )
             session.add(addr)
         else:
+            addr.path = path
             addr.position_id = container.position_id
             addr.container_id = container.id
             addr.shelf_id = addr.drawer_id = addr.slot_id = None
-            addr.path = path
             addr.depth = 0
             addr.is_active = True
 
         session.flush()
-        info_id(f"Address upserted for container {container.id} -> {path}", request_id=request_id)
+        info_id(f"[StorageAddress] Upserted container {container.id} -> {path}", request_id=request_id)
         return addr
 
     @classmethod
@@ -1602,10 +1829,9 @@ class StorageAddress(Base):
         if not shelf:
             raise ValueError("Shelf not found")
 
-        # ✅ FIX: pass the Container object, not container_id
-        cont_addr = cls.upsert_for_container(session, shelf.container, request_id=request_id) if shelf.container else None
-        base = cont_addr.path if cont_addr else cls._prefix_from_position(session, shelf.position_id)
-        path = f"{base}-{shelf.id:02d}"
+        container = shelf.container
+        cont_addr = cls.upsert_for_container(session, container, request_id=request_id) if container else None
+        path = shelf.name  # unified name already includes container prefix
 
         addr = session.execute(
             select(cls).where(cls.entity_type == "shelf", cls.entity_id == shelf.id)
@@ -1624,16 +1850,16 @@ class StorageAddress(Base):
             )
             session.add(addr)
         else:
+            addr.path = path
             addr.position_id = shelf.position_id
             addr.container_id = shelf.container_id
             addr.shelf_id = shelf.id
             addr.drawer_id = addr.slot_id = None
-            addr.path = path
             addr.depth = 1
             addr.is_active = True
 
         session.flush()
-        info_id(f"Address upserted for shelf {shelf.id} -> {path}", request_id=request_id)
+        info_id(f"[StorageAddress] Upserted shelf {shelf.id} -> {path}", request_id=request_id)
         return addr
 
     @classmethod
@@ -1641,68 +1867,83 @@ class StorageAddress(Base):
     def upsert_for_drawer(cls, session: Session, drawer, request_id=None):
         from app.modules.database.shopsync_db import Drawer
         if isinstance(drawer, int):
-            info_id(f"[upsert_for_drawer] Looking up Drawer id={drawer}", request_id=request_id)
             drawer = session.get(Drawer, drawer)
-
         if not drawer:
-            error_id("[upsert_for_drawer] Drawer not found", request_id=request_id)
-            return None
+            raise ValueError("Drawer not found")
 
-        info_id(
-            f"[upsert_for_drawer] Drawer={drawer.id}, shelf_id={getattr(drawer, 'shelf_id', None)}, "
-            f"position_id={getattr(drawer, 'position_id', None)}",
-            request_id=request_id,
-        )
+        shelf = drawer.shelf
+        shelf_addr = cls.upsert_for_shelf(session, shelf, request_id=request_id) if shelf else None
+        path = drawer.name  # unified naming already carries the full chain
 
-        # Resolve parent shelf
-        shelf = getattr(drawer, "shelf", None)
-        if shelf:
-            info_id(f"[upsert_for_drawer] Drawer {drawer.id} has ORM shelf id={shelf.id}", request_id=request_id)
-        elif getattr(drawer, "shelf_id", None):
-            info_id(f"[upsert_for_drawer] Drawer {drawer.id} shelf is None, fetching by shelf_id={drawer.shelf_id}",
-                    request_id=request_id)
-            shelf = session.get(type(shelf), drawer.shelf_id)  # safe fallback
+        addr = session.execute(
+            select(cls).where(cls.entity_type == "drawer", cls.entity_id == drawer.id)
+        ).scalar_one_or_none()
 
-        if not shelf:
-            error_id(f"[upsert_for_drawer] Drawer {drawer.id} has no shelf (shelf_id={drawer.shelf_id})",
-                     request_id=request_id)
+        if not addr:
+            addr = cls(
+                entity_type="drawer",
+                entity_id=drawer.id,
+                position_id=drawer.position_id,
+                shelf_id=drawer.shelf_id,
+                drawer_id=drawer.id,
+                path=path,
+                depth=2,
+                is_active=True,
+            )
+            session.add(addr)
+        else:
+            addr.path = path
+            addr.position_id = drawer.position_id
+            addr.shelf_id = drawer.shelf_id
+            addr.drawer_id = drawer.id
+            addr.slot_id = None
+            addr.depth = 2
+            addr.is_active = True
 
-        # Then continue with your address building...
+        session.flush()
+        info_id(f"[StorageAddress] Upserted drawer {drawer.id} -> {path}", request_id=request_id)
+        return addr
 
     @classmethod
     @with_request_id
     def upsert_for_slot(cls, session: Session, slot, request_id=None):
-        from app.modules.database.shopsync_db import DrawerSlot, Drawer
-        debug_id(f"[upsert_for_slot] called with slot={slot!r} (type={type(slot)})", request_id=request_id)
-
+        from app.modules.database.shopsync_db import DrawerSlot
         if isinstance(slot, int):
-            slot_id = slot
-            slot = session.get(DrawerSlot, slot_id)
-            debug_id(f"[upsert_for_slot] looked up slot_id={slot_id} -> {slot!r}", request_id=request_id)
+            slot = session.get(DrawerSlot, slot)
+        if not slot:
+            raise ValueError("DrawerSlot not found")
 
-        if slot is None:
-            error_id(f"[upsert_for_slot] Slot argument is None (caller passed {slot!r})", request_id=request_id)
-            import traceback
-            error_id("".join(traceback.format_stack(limit=5)), request_id=request_id)
-            return None
+        drawer = slot.drawer
+        drawer_addr = cls.upsert_for_drawer(session, drawer, request_id=request_id) if drawer else None
+        path = slot.slot_label  # already a full hierarchical name
 
-        info_id(f"[upsert_for_slot] Slot id={slot.id}, drawer_id={getattr(slot, 'drawer_id', None)}",
-                request_id=request_id)
+        addr = session.execute(
+            select(cls).where(cls.entity_type == "slot", cls.entity_id == slot.id)
+        ).scalar_one_or_none()
 
-        if not getattr(slot, "drawer_id", None) and not getattr(slot, "drawer", None):
-            error_id(f"[upsert_for_slot] Slot {slot.id} has no drawer_id and no drawer relationship!",
-                     request_id=request_id)
-            return None
+        if not addr:
+            addr = cls(
+                entity_type="slot",
+                entity_id=slot.id,
+                position_id=drawer.position_id if drawer else None,
+                drawer_id=drawer.id if drawer else None,
+                slot_id=slot.id,
+                path=path,
+                depth=3,
+                is_active=True,
+            )
+            session.add(addr)
+        else:
+            addr.path = path
+            addr.position_id = drawer.position_id if drawer else None
+            addr.drawer_id = drawer.id if drawer else None
+            addr.slot_id = slot.id
+            addr.depth = 3
+            addr.is_active = True
 
-        drawer = slot.drawer or session.get(Drawer, slot.drawer_id)
-        if not drawer:
-            error_id(f"[upsert_for_slot] Drawer missing for slot {slot.id} (drawer_id={slot.drawer_id})",
-                     request_id=request_id)
-            return None
-
-        info_id(f"[upsert_for_slot] Slot {slot.id} resolved drawer {drawer.id}", request_id=request_id)
-        return slot
-
+        session.flush()
+        info_id(f"[StorageAddress] Upserted slot {slot.id} -> {path}", request_id=request_id)
+        return addr
 
 class Container(Base):
     __tablename__ = "container"
@@ -1734,18 +1975,85 @@ class Container(Base):
 
     @classmethod
     @with_request_id
-    def add_container(cls, session: Session, position_id: int,
-                      name: str, description: str = None, request_id=None):
-        name = cls._norm(name)
-        obj = cls(
-            position_id=position_id,
-            name=name,
-            description=(description or "").strip() or None,
-        )
-        session.add(obj)
-        session.flush()
-        info_id(f"Created Container '{name}' on position {position_id}", request_id=request_id)
-        return obj
+    def add_container(
+            cls,
+            session,
+            position_id,
+            campus_id=None,
+            building_id=None,
+            site_id=None,
+            name=None,
+            description=None,
+            request_id=None,
+    ):
+        """
+        Add a new container with a context-aware auto-generated name.
+        Format:
+            <Campus2><BuildingID>-<SiteID>-<AreaLast3>-<ContainerID>
+        Example:
+            AU-12-23-3
+        """
+        rid = request_id or get_request_id()
+        try:
+            # ------------------------------
+            # 1. Verify Position
+            # ------------------------------
+            position = session.query(Position).filter(Position.id == position_id).first()
+            if not position:
+                error_id(f"[Container.add_container] Position ID {position_id} not found", rid)
+                return None
+
+            # ------------------------------
+            # 2. Create placeholder to get ID
+            # ------------------------------
+            temp_container = cls(
+                position_id=position_id,
+                name="TEMP",  # temporary until final name built
+                description=description or ""
+            )
+            session.add(temp_container)
+            session.flush()  # assigns container.id
+
+            # ------------------------------
+            # 3. Fetch related context entities
+            # ------------------------------
+            from app.modules.database.shopsync_db import Campus, Building, SiteLocation, Area
+
+            campus = session.get(Campus, campus_id) if campus_id else None
+            building = session.get(Building, building_id) if building_id else None
+            site = session.get(SiteLocation, site_id) if site_id else getattr(position, "site_location", None)
+            area = getattr(position, "area", None)
+
+            # ------------------------------
+            # 4. Build name components
+            # ------------------------------
+            campus_code = (getattr(campus, "name", None) or "XX")[:2].upper()
+            build_code = str(getattr(building, "id", "00"))
+            site_code = str(getattr(site, "id", "00"))
+            area_name = getattr(area, "name", None) or getattr(site, "site_area", "XXX")
+            area_code = area_name[-3:].upper() if area_name else "XXX"
+            container_id = temp_container.id
+
+            # ------------------------------
+            # 5. Construct final name
+            # ------------------------------
+            auto_name = f"{campus_code}-{build_code}-{site_code}-{area_code}-{container_id}"
+            temp_container.name = name or auto_name
+
+            # ------------------------------
+            # 6. Commit and log
+            # ------------------------------
+            session.commit()
+            info_id(
+                f"[Container.add_container] Created container id={temp_container.id} name={temp_container.name}",
+                rid,
+            )
+            return temp_container
+
+        except Exception as e:
+            session.rollback()
+            error_id(f"[Container.add_container] Error creating container: {e}", rid, exc_info=True)
+            return None
 
     @classmethod
     @with_request_id
@@ -1814,22 +2122,59 @@ class Shelf(Base):
             raise ValueError("Shelf name is required.")
         return n
 
+        # ------------------------------
+        # Add Shelf with unified naming
+        # ------------------------------
     @classmethod
     @with_request_id
-    def add_shelf(cls, session: Session, position_id: int, name: str,
-                  container_id: int | None = None, description: str | None = None, request_id=None):
-        name = cls._norm(name)
-        obj = cls(
-            position_id=position_id,
-            container_id=container_id,
-            name=name,
-            description=(description or "").strip() or None,
-        )
-        session.add(obj)
-        session.flush()
-        where = f"container={container_id}" if container_id else "no-container"
-        info_id(f"Created Shelf '{name}' on position {position_id} ({where})", request_id=request_id)
-        return obj
+    def add_shelf(cls, session, container_id, position_id=None, name=None, description=None, request_id=None):
+        """
+        Add a new shelf with context-aware auto-generated name.
+        Uses container naming as the base (e.g., AU-1-23-LAB-3-SH01).
+        Resets numbering per container.
+        """
+        rid = request_id or get_request_id()
+        try:
+            from app.modules.database.shopsync_db import Container, Position
+            container = session.get(Container, container_id)
+            if not container:
+                error_id(f"[Shelf.add_shelf] Container {container_id} not found", rid)
+                return None
+
+            # Fallback position
+            if not position_id:
+                position_id = getattr(container, "position_id", None)
+                if not position_id:
+                    pos = Position(site_location_id=getattr(container.position, "site_location_id", None))
+                    session.add(pos)
+                    session.flush()
+                    position_id = pos.id
+                    info_id(f"[Shelf.add_shelf] Created fallback Position id={pos.id}", rid)
+
+            # Count existing shelves for this container
+            existing_count = session.query(cls).filter(cls.container_id == container_id).count()
+            suffix_num = existing_count + 1
+            suffix = f"SH{suffix_num:02d}"
+            base_name = container.name
+            auto_name = f"{base_name}-{suffix}"
+
+            shelf = cls(
+                container_id=container_id,
+                position_id=position_id,
+                name=name or auto_name,
+                description=description or "",
+            )
+
+            session.add(shelf)
+            session.commit()
+
+            info_id(f"[Shelf.add_shelf] Created shelf id={shelf.id} name={shelf.name}", rid)
+            return shelf
+
+        except Exception as e:
+            session.rollback()
+            error_id(f"[Shelf.add_shelf] Error: {e}", rid, exc_info=True)
+            return None
 
     @classmethod
     @with_request_id
@@ -1906,19 +2251,47 @@ class Drawer(Base):
 
     @classmethod
     @with_request_id
-    def add_drawer(cls, session: Session, position_id: int, name: str,
-                   shelf_id: int | None = None, description: str | None = None, request_id=None):
-        name = cls._norm(name)
-        obj = cls(
-            position_id=position_id,
-            shelf_id=shelf_id,
-            name=name,
-            description=(description or "").strip() or None,
-        )
-        session.add(obj)
-        session.flush()
-        info_id(f"Created Drawer '{name}' (pos={position_id}, shelf={shelf_id})", request_id=request_id)
-        return obj
+    def add_drawer(cls, session, shelf_id, position_id=None, name=None, description=None, request_id=None):
+        """
+        Add a new drawer using unified naming.
+        Format: <ShelfName>-DR##.
+        Resets numbering per shelf.
+        """
+        rid = request_id or get_request_id()
+        try:
+            shelf = session.get(Shelf, shelf_id)
+            if not shelf:
+                error_id(f"[Drawer.add_drawer] Shelf {shelf_id} not found", rid)
+                return None
+
+            # Count existing drawers under this shelf
+            existing_count = session.query(cls).filter(cls.shelf_id == shelf_id).count()
+            suffix_num = existing_count + 1
+            suffix = f"DR{suffix_num:02d}"
+
+            base_name = shelf.name
+            auto_name = f"{base_name}-{suffix}"
+
+            drawer = cls(
+                shelf_id=shelf_id,
+                position_id=position_id or getattr(shelf, "position_id", None),
+                name=name or auto_name,
+                description=description or "",
+            )
+            session.add(drawer)
+            session.flush()
+
+            from app.modules.database.shopsync_db import StorageAddress
+            StorageAddress.upsert_for_drawer(session, drawer, request_id=rid)
+
+            session.commit()
+            info_id(f"[Drawer.add_drawer] Created drawer id={drawer.id} name={drawer.name}", rid)
+            return drawer
+
+        except Exception as e:
+            session.rollback()
+            error_id(f"[Drawer.add_drawer] Error creating drawer: {e}", rid, exc_info=True)
+            return None
 
     @classmethod
     @with_request_id
@@ -1988,28 +2361,47 @@ class DrawerSlot(Base):
 
     @classmethod
     @with_request_id
-    def add_slot(cls, session: Session, drawer_id: int, *,
-                 slot_label: str | None = None,
-                 row_index: int | None = None,
-                 col_index: int | None = None,
-                 note: str | None = None,
-                 request_id=None):
-        if not slot_label and row_index is None and col_index is None:
-            raise ValueError("Provide slot_label or row/col to identify a slot.")
+    def add_slot(cls, session, drawer_id, name=None, note=None, request_id=None):
+        """
+        Add a new drawer slot using unified naming.
+        Format: <DrawerName>-SL##.
+        Resets numbering per drawer.
+        """
+        rid = request_id or get_request_id()
+        try:
+            drawer = session.get(Drawer, drawer_id)
+            if not drawer:
+                error_id(f"[DrawerSlot.add_slot] Drawer {drawer_id} not found", rid)
+                return None
 
-        obj = cls(
-            drawer_id=drawer_id,
-            slot_label=(slot_label or "").strip() or None,
-            row_index=row_index,
-            col_index=col_index,
-            note=(note or "").strip() or None,
-        )
-        session.add(obj)
-        session.flush()
+            # Count existing slots under this drawer
+            existing_count = session.query(cls).filter(cls.drawer_id == drawer_id).count()
+            suffix_num = existing_count + 1
+            suffix = f"SL{suffix_num:02d}"
 
-        where = slot_label or f"r{row_index}c{col_index}"
-        info_id(f"Created DrawerSlot '{where}' in drawer {drawer_id}", request_id=request_id)
-        return obj
+            base_name = drawer.name
+            auto_label = f"{base_name}-{suffix}"
+
+            slot = cls(
+                drawer_id=drawer_id,
+                slot_label=name or auto_label,
+                note=note or "",
+            )
+
+            session.add(slot)
+            session.flush()
+
+            from app.modules.database.shopsync_db import StorageAddress
+            StorageAddress.upsert_for_slot(session, slot, request_id=rid)
+
+            session.commit()
+            info_id(f"[DrawerSlot.add_slot] Created slot id={slot.id} label={slot.slot_label}", rid)
+            return slot
+
+        except Exception as e:
+            session.rollback()
+            error_id(f"[DrawerSlot.add_slot] Error creating slot: {e}", rid, exc_info=True)
+            return None
 
     @classmethod
     @with_request_id
@@ -2077,7 +2469,9 @@ class Inventory(Base):
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
+    # -------------------
     # Relationships
+    # -------------------
     part = relationship("Part", back_populates="inventories")
     container = relationship("Container", foreign_keys=[container_id], lazy="select")
     shelf = relationship("Shelf", foreign_keys=[shelf_id], lazy="select")
@@ -2094,13 +2488,17 @@ class Inventory(Base):
     )
 
     # -------------------------
-    # Adjustments / transfers
+    # Quantity Adjustments
     # -------------------------
     @classmethod
     def adjust(cls, session: Session, *, part_id: int,
                container_id=None, shelf_id=None, drawer_id=None, drawer_slot_id=None,
                delta: int) -> "Inventory":
-        """Add/remove quantity at a location (positive delta adds, negative removes)."""
+        """
+        Add or remove quantity at a location (positive delta adds, negative removes).
+        Automatically maintains StorageAddress linkage.
+        """
+        from app.modules.database.shopsync_db import StorageAddress
         if delta == 0:
             raise ValueError("delta must be non-zero.")
 
@@ -2119,6 +2517,7 @@ class Inventory(Base):
             if new_qty < 0:
                 raise ValueError(f"Insufficient stock (have {row.quantity}, need {-delta}).")
             row.quantity = new_qty
+            info_id(f"[Inventory.adjust] Updated quantity to {new_qty} for part {part_id}")
         else:
             if delta < 0:
                 raise ValueError("Cannot create inventory with negative quantity.")
@@ -2131,17 +2530,28 @@ class Inventory(Base):
                 quantity=delta,
             )
             session.add(row)
+            info_id(f"[Inventory.adjust] Created new inventory record for part {part_id}")
 
         try:
             session.commit()
+            # ✅ Synchronize StorageAddress
+            row.ensure_storage_address(session)
+            session.commit()
             return row
-        except SQLAlchemyError:
+        except SQLAlchemyError as e:
             session.rollback()
+            error_id(f"[Inventory.adjust] Error: {e}", exc_info=True)
             raise
 
+    # -------------------------
+    # Transfers Between Locations
+    # -------------------------
     @classmethod
     def transfer(cls, session: Session, *, part_id: int, from_loc: dict, to_loc: dict, qty: int) -> tuple["Inventory", "Inventory"]:
-        """Move qty of a part from one location to another."""
+        """
+        Move qty of a part from one location to another.
+        Updates both source and destination addresses automatically.
+        """
         if qty <= 0:
             raise ValueError("qty must be positive.")
 
@@ -2185,29 +2595,35 @@ class Inventory(Base):
 
         try:
             session.commit()
+            # ✅ Sync both addresses
+            src.ensure_storage_address(session)
+            dst.ensure_storage_address(session)
+            session.commit()
+            info_id(f"[Inventory.transfer] Moved {qty} of part {part_id} from {from_loc} → {to_loc}")
             return src, dst
-        except SQLAlchemyError:
+        except SQLAlchemyError as e:
             session.rollback()
+            error_id(f"[Inventory.transfer] Error: {e}", exc_info=True)
             raise
 
+    # -------------------------
+    # Data for UI Display
+    # -------------------------
     @classmethod
     def fetch_inventory_rows(cls, session: Session, limit: int = 500) -> list[tuple]:
         """
         Fetch inventory rows for UI table.
-        Always returns 8 values per row:
+        Returns 8-tuple:
           (id, part_name, part_type, location, quantity, unit, updated_str, updated_ts)
         """
         q = (
             session.query(cls)
             .options(
                 joinedload(cls.part),
-                joinedload(cls.container).joinedload(Container.position).joinedload(Position.site_location),
-                joinedload(cls.shelf).joinedload(Shelf.container).joinedload(Container.position).joinedload(
-                    Position.site_location),
-                joinedload(cls.drawer).joinedload(Drawer.shelf).joinedload(Shelf.container).joinedload(
-                    Container.position).joinedload(Position.site_location),
-                joinedload(cls.drawer_slot).joinedload(DrawerSlot.drawer).joinedload(Drawer.shelf)
-                .joinedload(Shelf.container).joinedload(Container.position).joinedload(Position.site_location),
+                joinedload(cls.container),
+                joinedload(cls.shelf).joinedload(Shelf.container),
+                joinedload(cls.drawer).joinedload(Drawer.shelf),
+                joinedload(cls.drawer_slot).joinedload(DrawerSlot.drawer),
             )
             .order_by(cls.id.desc())
             .limit(limit)
@@ -2215,7 +2631,6 @@ class Inventory(Base):
 
         rows = []
         for inv in q.all():
-            # ---- Core safe lookups ----
             id_ = inv.id
             part_name = getattr(inv.part, "name", "") or ""
             part_type = getattr(inv.part, "model", "") or ""
@@ -2223,30 +2638,26 @@ class Inventory(Base):
             unit = inv.unit or ""
 
             # Updated timestamps
+            updated_str, updated_ts = ("", 0)
             if inv.updated_at:
                 updated_str = inv.updated_at.strftime("%Y-%m-%d %H:%M")
                 updated_ts = inv.updated_at.timestamp()
-            else:
-                updated_str, updated_ts = "", 0
 
-            # Resolve location string (safe)
+            # ---- Unified Location Resolution ----
             try:
-                loc_parts = []
-                if inv.container and inv.container.position and inv.container.position.site_location:
-                    loc_parts.append(inv.container.position.site_location.title or "")
-                if inv.container:
-                    loc_parts.append(inv.container.title or "")
-                if inv.shelf:
-                    loc_parts.append(inv.shelf.title or "")
-                if inv.drawer:
-                    loc_parts.append(inv.drawer.title or "")
                 if inv.drawer_slot:
-                    loc_parts.append(inv.drawer_slot.title or "")
-                location = " / ".join([p for p in loc_parts if p]) or "(unassigned)"
+                    location = inv.drawer_slot.slot_label
+                elif inv.drawer:
+                    location = inv.drawer.name
+                elif inv.shelf:
+                    location = inv.shelf.name
+                elif inv.container:
+                    location = inv.container.name
+                else:
+                    location = "(unassigned)"
             except Exception:
                 location = "(error resolving location)"
 
-            # ---- Always append 8-tuple ----
             rows.append(
                 (
                     id_,
@@ -2262,6 +2673,26 @@ class Inventory(Base):
 
         return rows
 
+    # -------------------------
+    # Storage Address Sync
+    # -------------------------
+    def ensure_storage_address(self, session: Session):
+        """
+        Ensure StorageAddress entry exists and is up-to-date
+        for this inventory’s physical location.
+        """
+        from app.modules.database.shopsync_db import StorageAddress
+        try:
+            if self.drawer_slot:
+                StorageAddress.upsert_for_slot(session, self.drawer_slot)
+            elif self.drawer:
+                StorageAddress.upsert_for_drawer(session, self.drawer)
+            elif self.shelf:
+                StorageAddress.upsert_for_shelf(session, self.shelf)
+            elif self.container:
+                StorageAddress.upsert_for_container(session, self.container)
+        except Exception as e:
+            error_id(f"[Inventory.ensure_storage_address] Failed for inventory {self.id}: {e}", exc_info=True)
 
 class Part(Base):
     __tablename__ = "part"
@@ -3693,7 +4124,6 @@ class PartsPositionImageAssociation(Base):
             error_id(f"Error during _get_positions_by_hierarchy with filters {filters}: {e}", request_id=request_id,
                      exc_info=True)
             raise
-
 
 class Image(Base):
     __tablename__ = 'image'

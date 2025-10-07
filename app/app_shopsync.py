@@ -1518,7 +1518,6 @@ class PartLocationsDialog(QDialog):
 
         QMessageBox.information(self, "Deleted", f"{label} deleted successfully.")
 
-
 class AddStockDialog(QDialog):
     """Add or edit an Inventory row at Container/Shelf/Drawer/Slot level (with diagnostics)."""
     def __init__(self, parent, db_manager, *, preselected_part_id: int | None = None, existing_inventory_id: int | None = None):
@@ -1553,6 +1552,7 @@ class AddStockDialog(QDialog):
 
     def connect_cascade_signals(self):
         if not self._signals_connected:
+            self.area_combo.currentIndexChanged.connect(self.load_containers)
             self.container_combo.currentIndexChanged.connect(self.load_shelves)
             self.shelf_combo.currentIndexChanged.connect(self.load_drawers)
             self.drawer_combo.currentIndexChanged.connect(self.load_slots)
@@ -1561,6 +1561,10 @@ class AddStockDialog(QDialog):
 
     def disconnect_cascade_signals(self):
         if self._signals_connected:
+            try:
+                self.area_combo.currentIndexChanged.disconnect(self.load_containers)
+            except Exception:
+                pass
             try:
                 self.container_combo.currentIndexChanged.disconnect(self.load_shelves)
             except Exception:
@@ -1589,6 +1593,10 @@ class AddStockDialog(QDialog):
         # Location group
         grp = QGroupBox("Location")
         form = QFormLayout(grp)
+        # --- Area ---
+        self.area_combo = QComboBox()
+        form.addRow("Area:", self.area_combo)
+        # --- Container hierarchy ---
         self.container_combo = QComboBox()
         self.shelf_combo = QComboBox()
         self.drawer_combo = QComboBox()
@@ -1597,6 +1605,7 @@ class AddStockDialog(QDialog):
         form.addRow("Shelf:", self.shelf_combo)
         form.addRow("Drawer:", self.drawer_combo)
         form.addRow("Slot:", self.slot_combo)
+
         layout.addWidget(grp)
 
         # qty/unit
@@ -1628,6 +1637,22 @@ class AddStockDialog(QDialog):
         self.connect_cascade_signals()
 
     # ---------- Loaders (with prints) ----------
+    def load_areas(self):
+        """Load all available Areas into the combo box."""
+        print("[load_areas] start")
+        with QSignalBlocker(self.area_combo):
+            self.area_combo.clear()
+            self.area_combo.addItem("— Select Area —", None)
+            try:
+                with self.db_manager.session_scope() as s:
+                    rows = s.query(Area).order_by(Area.name.asc()).all()
+                print(f"[load_areas] fetched {len(rows)} areas")
+                for a in rows:
+                    self.area_combo.addItem(a.name, a.id)
+            except Exception as e:
+                print(f"[load_areas] ERROR: {e}")
+        self.dump_combo(self.area_combo, "area_combo")
+
     def load_parts(self):
         print("[load_parts] start")
         with QSignalBlocker(self.part_combo):
@@ -1651,7 +1676,14 @@ class AddStockDialog(QDialog):
             self.container_combo.addItem("— Select Container —", None)
             try:
                 with self.db_manager.session_scope() as s:
-                    rows = s.query(Container).order_by(Container.name).all()
+                    area_id = self.area_combo.currentData()
+                    query = s.query(Container).join(Position, Container.position_id == Position.id)
+
+                    if area_id:
+                        query = query.filter(Position.area_id == area_id)
+
+                    rows = query.order_by(Container.name).all()
+
                 print(f"[load_containers] fetched {len(rows)} containers")
                 for c in rows:
                     print(f"[load_containers] add: id={c.id} name='{c.name}'")
@@ -1734,6 +1766,7 @@ class AddStockDialog(QDialog):
 
         # Base lists
         self.load_parts()
+        self.load_areas()
         self.load_containers()
 
         # Part preselect
@@ -1811,6 +1844,9 @@ class AddStockDialog(QDialog):
 
             unit = (self.unit_edit.text().strip() or None)
 
+            # --- New: Capture area selection ---
+            area_id = self.area_combo.currentData()
+
             container_id = self.container_combo.currentData()
             shelf_id = self.shelf_combo.currentData()
             drawer_id = self.drawer_combo.currentData()
@@ -1832,6 +1868,10 @@ class AddStockDialog(QDialog):
                 inv.shelf_id = shelf_id
                 inv.drawer_id = drawer_id
                 inv.drawer_slot_id = slot_id
+
+                # --- Optional: Assign area if schema supports it ---
+                if hasattr(inv, "area_id"):
+                    inv.area_id = area_id
 
                 s.commit()
 
@@ -2066,78 +2106,111 @@ class AddLocationWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.db_manager = None
-        # Slot group only shown if DrawerSlot model is available
         self._has_drawer_slot = True
         self._build_ui()
         self._wire_signals()
 
-    def _clear_fields(self):
-        self._clear_site_fields()
-        self.cont_name.clear()
-        self.shelf_name.clear()
-        self.drawer_label.clear()
-        if self._has_drawer_slot:
-            self.slot_label.clear()
-
+    # ---------- Public ----------
     def set_db_manager(self, db_manager):
         self.db_manager = db_manager
         self.refresh_all()
+
+    def refresh_all(self):
+        if not self.db_manager:
+            return
+        self._load_campuses()
+        self._load_buildings()
+        self._load_areas()
+        self._load_sites()
+        self._load_containers()
+        self._load_shelves()
+        self._load_drawers()
+        if self._has_drawer_slot:
+            self._load_slots()
+        self._update_buttons_enabled()
 
     # ---------- UI ----------
     def _build_ui(self):
         outer = QVBoxLayout(self)
 
-        # --- Site Location group ---
+        # --- Campus ---
+        grp_campus = QGroupBox("Campus")
+        frm_campus = QFormLayout(grp_campus)
+        self.campus_pick = QComboBox()
+        self.campus_pick.setEditable(True)
+        self.btn_campus_refresh = QPushButton("Refresh")
+        self.btn_campus_add = QPushButton("Add Campus")
+        frm_campus.addRow("Pick Existing:", self.campus_pick)
+        row_camp_btns = QHBoxLayout()
+        row_camp_btns.addWidget(self.btn_campus_refresh)
+        row_camp_btns.addWidget(self.btn_campus_add)
+        frm_campus.addRow(row_camp_btns)
+        outer.addWidget(grp_campus)
+
+        # --- Building ---
+        grp_building = QGroupBox("Building")
+        frm_building = QFormLayout(grp_building)
+        self.building_pick = QComboBox()
+        self.building_pick.setEditable(True)
+        self.btn_building_refresh = QPushButton("Refresh")
+        self.btn_building_add = QPushButton("Add Building")
+        frm_building.addRow("Pick Existing:", self.building_pick)
+        row_build_btns = QHBoxLayout()
+        row_build_btns.addWidget(self.btn_building_refresh)
+        row_build_btns.addWidget(self.btn_building_add)
+        frm_building.addRow(row_build_btns)
+        outer.addWidget(grp_building)
+
+        # --- Site Location ---
         grp_site = QGroupBox("Site Location (Room)")
         frm_site = QFormLayout(grp_site)
-
         self.site_pick = QComboBox()
         self.site_pick.setEditable(True)
         self.site_pick.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-
         self._site_completer = QCompleter(self.site_pick.model(), self.site_pick)
         self._site_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self._site_completer.setFilterMode(Qt.MatchFlag.MatchContains)
         self.site_pick.setCompleter(self._site_completer)
-
         self._site_search_timer = QTimer(self)
         self._site_search_timer.setSingleShot(True)
         self._site_search_timer.setInterval(200)
         self._site_search_timer.timeout.connect(self._perform_site_search)
         self.site_pick.lineEdit().textEdited.connect(self._on_site_text_edited)
-
         self.site_title = QLineEdit()
         self.site_room = QLineEdit()
-        self.site_area = QLineEdit()
+        self.area_pick = QComboBox()
+        self.btn_area_refresh = QPushButton("Refresh Areas")
         self.btn_site_refresh = QPushButton("Refresh")
         self.btn_site_add = QPushButton("Add Site Location")
         frm_site.addRow("Pick Existing:", self.site_pick)
-        frm_site.addRow("Title (e.g., 'Storeroom A'):", self.site_title)
+        frm_site.addRow("Title:", self.site_title)
         frm_site.addRow("Room Number:", self.site_room)
-        frm_site.addRow("Area:", self.site_area)
+        frm_site.addRow("Area:", self.area_pick)
+        frm_site.addRow(self.btn_area_refresh)
         row_site_btns = QHBoxLayout()
         row_site_btns.addWidget(self.btn_site_refresh)
         row_site_btns.addWidget(self.btn_site_add)
         frm_site.addRow(row_site_btns)
         outer.addWidget(grp_site)
 
-        # --- Container group ---
+        # --- Container ---
         grp_cont = QGroupBox("Container")
         frm_cont = QFormLayout(grp_cont)
         self.cont_pick = QComboBox()
         self.cont_name = QLineEdit()
+        self.cont_name.setReadOnly(True)
         self.btn_cont_refresh = QPushButton("Refresh")
         self.btn_cont_add = QPushButton("Add Container")
         self.btn_cont_add.setEnabled(False)
         frm_cont.addRow("Pick Existing:", self.cont_pick)
-        frm_cont.addRow("Name (e.g., 'Rack 12'):", self.cont_name)
+        frm_cont.addRow("Auto-Generated Name:", self.cont_name)
         row_cont_btns = QHBoxLayout()
         row_cont_btns.addWidget(self.btn_cont_refresh)
         row_cont_btns.addWidget(self.btn_cont_add)
         frm_cont.addRow(row_cont_btns)
         outer.addWidget(grp_cont)
 
-        # --- Shelf group ---
+        # --- Shelf ---
         grp_shelf = QGroupBox("Shelf")
         frm_shelf = QFormLayout(grp_shelf)
         self.shelf_pick = QComboBox()
@@ -2146,14 +2219,14 @@ class AddLocationWidget(QWidget):
         self.btn_shelf_add = QPushButton("Add Shelf")
         self.btn_shelf_add.setEnabled(False)
         frm_shelf.addRow("Pick Existing:", self.shelf_pick)
-        frm_shelf.addRow("Name (required):", self.shelf_name)
+        frm_shelf.addRow("Name:", self.shelf_name)
         row_shelf_btns = QHBoxLayout()
         row_shelf_btns.addWidget(self.btn_shelf_refresh)
         row_shelf_btns.addWidget(self.btn_shelf_add)
         frm_shelf.addRow(row_shelf_btns)
         outer.addWidget(grp_shelf)
 
-        # --- Drawer group ---
+        # --- Drawer ---
         grp_drawer = QGroupBox("Drawer")
         frm_drawer = QFormLayout(grp_drawer)
         self.drawer_pick = QComboBox()
@@ -2162,14 +2235,14 @@ class AddLocationWidget(QWidget):
         self.btn_drawer_add = QPushButton("Add Drawer")
         self.btn_drawer_add.setEnabled(False)
         frm_drawer.addRow("Pick Existing:", self.drawer_pick)
-        frm_drawer.addRow("Label (e.g., 'Drawer 1'):", self.drawer_label)
+        frm_drawer.addRow("Label:", self.drawer_label)
         row_drawer_btns = QHBoxLayout()
         row_drawer_btns.addWidget(self.btn_drawer_refresh)
         row_drawer_btns.addWidget(self.btn_drawer_add)
         frm_drawer.addRow(row_drawer_btns)
         outer.addWidget(grp_drawer)
 
-        # --- Slot group ---
+        # --- Slot ---
         self.grp_slot = QGroupBox("Slot")
         frm_slot = QFormLayout(self.grp_slot)
         self.slot_pick = QComboBox()
@@ -2178,7 +2251,7 @@ class AddLocationWidget(QWidget):
         self.btn_slot_add = QPushButton("Add Slot")
         self.btn_slot_add.setEnabled(False)
         frm_slot.addRow("Pick Existing:", self.slot_pick)
-        frm_slot.addRow("Label (e.g., 'R1-C3' or 'Bin A'):", self.slot_label)
+        frm_slot.addRow("Label:", self.slot_label)
         row_slot_btns = QHBoxLayout()
         row_slot_btns.addWidget(self.btn_slot_refresh)
         row_slot_btns.addWidget(self.btn_slot_add)
@@ -2197,40 +2270,57 @@ class AddLocationWidget(QWidget):
         foot.addStretch()
         outer.addLayout(foot)
 
+    # ---------- Wiring ----------
     def _wire_signals(self):
+        self.btn_campus_refresh.clicked.connect(self._load_campuses)
+        self.btn_building_refresh.clicked.connect(self._load_buildings)
+        self.btn_campus_add.clicked.connect(self._add_campus)
+        self.btn_building_add.clicked.connect(self._add_building)
         self.btn_site_refresh.clicked.connect(self._load_sites)
+        self.btn_site_add.clicked.connect(self._add_site)
         self.btn_cont_refresh.clicked.connect(self._load_containers)
+        self.btn_cont_add.clicked.connect(self._add_container)
         self.btn_shelf_refresh.clicked.connect(self._load_shelves)
+        self.btn_shelf_add.clicked.connect(self._add_shelf)
         self.btn_drawer_refresh.clicked.connect(self._load_drawers)
+        self.btn_drawer_add.clicked.connect(self._add_drawer)
         self.btn_slot_refresh.clicked.connect(self._load_slots)
-
+        self.btn_slot_add.clicked.connect(self._add_slot)
         self.btn_refresh_all.clicked.connect(self.refresh_all)
         self.btn_clear_fields.clicked.connect(self._clear_fields)
-
-        self.btn_site_add.clicked.connect(self._add_site)
-        self.btn_cont_add.clicked.connect(self._add_container)
-        self.btn_shelf_add.clicked.connect(self._add_shelf)
-        self.btn_drawer_add.clicked.connect(self._add_drawer)
-        self.btn_slot_add.clicked.connect(self._add_slot)
-
+        self.campus_pick.currentIndexChanged.connect(self._on_campus_changed)
+        self.building_pick.currentIndexChanged.connect(self._on_building_changed)
         self.site_pick.currentIndexChanged.connect(self._on_site_changed)
         self.cont_pick.currentIndexChanged.connect(self._on_container_changed)
         self.shelf_pick.currentIndexChanged.connect(self._on_shelf_changed)
         self.drawer_pick.currentIndexChanged.connect(self._on_drawer_changed)
 
-    # ---------- Public ----------
-    def refresh_all(self):
+    # ---------- Loaders ----------
+    def _load_campuses(self):
+        self.campus_pick.clear()
         if not self.db_manager:
             return
-        self._load_sites()
-        self._load_containers()
-        self._load_shelves()
-        self._load_drawers()
-        if self._has_drawer_slot:
-            self._load_slots()
+        from app.modules.database.shopsync_db import Campus
+        with self.db_manager.session_scope() as s:
+            rows = s.query(Campus).order_by(Campus.name.asc()).all()
+        for c in rows:
+            self.campus_pick.addItem(c.name, c.id)
         self._update_buttons_enabled()
 
-    # ---------- Loaders ----------
+    def _load_buildings(self):
+        self.building_pick.clear()
+        if not self.db_manager:
+            return
+        campus_id = self._current_id(self.campus_pick)
+        if not campus_id:
+            return
+        from app.modules.database.shopsync_db import Building
+        with self.db_manager.session_scope() as s:
+            rows = s.query(Building).filter(Building.campus_id == campus_id).order_by(Building.name.asc()).all()
+        for b in rows:
+            self.building_pick.addItem(f"{b.name} (ID {b.id})", b.id)
+        self._update_buttons_enabled()
+
     def _load_sites(self):
         self.site_pick.clear()
         if not self.db_manager:
@@ -2301,19 +2391,62 @@ class AddLocationWidget(QWidget):
             self.slot_pick.addItem(label, sl.id)
         self._update_buttons_enabled()
 
-    # ---------- Create ops ----------
+    def _load_areas(self):
+        """Load all Areas into the dropdown."""
+        self.area_pick.clear()
+        if not self.db_manager:
+            return
+        from app.modules.database.shopsync_db import Area
+        with self.db_manager.session_scope() as s:
+            rows = s.query(Area).order_by(Area.name.asc()).all()
+        if not rows:
+            self.area_pick.addItem("— no areas found —", None)
+            return
+        for a in rows:
+            self.area_pick.addItem(a.name, a.id)
+
+    # ---------- Create operations ----------
+    def _add_campus(self):
+        from app.modules.database.shopsync_db import Campus
+        name, ok = QInputDialog.getText(self, "Add Campus", "Campus name:")
+        if not ok or not name.strip():
+            return
+        with self.db_manager.session_scope() as s:
+            exist = s.query(Campus).filter(Campus.name == name.strip()).first()
+            if exist:
+                QMessageBox.information(self, "Duplicate", "Campus already exists.")
+                return
+            s.add(Campus(name=name.strip()))
+        self._load_campuses()
+
+    def _add_building(self):
+        from app.modules.database.shopsync_db import Building
+        campus_id = self._current_id(self.campus_pick)
+        if not campus_id:
+            QMessageBox.warning(self, "Select Campus", "Pick a campus first.")
+            return
+        name, ok = QInputDialog.getText(self, "Add Building", "Building name:")
+        if not ok or not name.strip():
+            return
+        with self.db_manager.session_scope() as s:
+            exist = s.query(Building).filter(
+                Building.campus_id == campus_id, Building.name == name.strip()
+            ).first()
+            if exist:
+                QMessageBox.information(self, "Duplicate", "Building already exists.")
+                return
+            s.add(Building(name=name.strip(), campus_id=campus_id))
+        self._load_buildings()
+
     def _add_site(self):
-        from app.modules.configuration import info_id, error_id, set_request_id
         from app.modules.database.shopsync_db import SiteLocation
         request_id = set_request_id()
-
         title = self.site_title.text().strip()
         room = self.site_room.text().strip()
         area = self.site_area.text().strip()
         if not title:
             QMessageBox.warning(self, "Missing Data", "Please enter a Site Location title.")
             return
-
         try:
             with self.db_manager.session_scope() as s:
                 existing = s.query(SiteLocation).filter(
@@ -2324,192 +2457,29 @@ class AddLocationWidget(QWidget):
                 if existing:
                     QMessageBox.information(self, "Duplicate", "Site Location already exists.")
                     return
-                obj = SiteLocation(title=title, room_number=room or None, site_area=area or None)
-                s.add(obj)
-                s.flush()
-                info_id(f"[AddLocation] Created SiteLocation id={obj.id}", request_id=request_id)
-            self._clear_site_fields()
+                s.add(SiteLocation(title=title, room_number=room or None, site_area=area or None))
+            self.site_title.clear()
+            self.site_room.clear()
+            self.site_area.clear()
             self._load_sites()
-            self._notify_inventory_refresh()
         except Exception as e:
             error_id(f"[AddLocation] Failed to create SiteLocation: {e}", request_id=request_id)
-            QMessageBox.critical(self, "Error", f"Failed to create Site Location:\n{e}")
+            QMessageBox.critical(self, "Error", str(e))
 
-    def _add_container(self):
-        from app.modules.configuration import info_id, error_id, set_request_id
-        from app.modules.database.shopsync_db import Container, Position, StorageAddress
-        request_id = set_request_id()
 
-        site_id = self._current_id(self.site_pick)
-        name = (self.cont_name.text() or "").strip()
-
-        if not site_id:
-            QMessageBox.warning(self, "Select Site", "Pick a Site Location first.")
-            return
-        if not name:
-            QMessageBox.warning(self, "Missing Data", "Please enter a Container name.")
-            return
-
-        try:
-            with self.db_manager.session_scope() as s:
-                pos = s.query(Position).filter(Position.site_location_id == site_id).first()
-                if not pos:
-                    pos = Position(site_location_id=site_id)
-                    s.add(pos)
-                    s.flush()
-
-                existing = s.query(Container).filter(Container.position_id == pos.id, Container.name == name).first()
-                if existing:
-                    QMessageBox.information(self, "Duplicate", "Container already exists.")
-                    return
-
-                obj = Container(position_id=pos.id, name=name)
-                s.add(obj)
-                s.flush()
-                StorageAddress.upsert_for_container(s, obj, request_id=request_id)
-                info_id(f"[AddLocation] Created Container id={obj.id}", request_id=request_id)
-
-            self.cont_name.clear()
-            self._load_containers()
-            self._notify_inventory_refresh()
-        except Exception as e:
-            error_id(f"[AddLocation] Failed to create Container: {e}", request_id=request_id)
-            QMessageBox.critical(self, "Error", f"Failed to create Container:\n{e}")
-
-    def _add_shelf(self):
-        from app.modules.configuration import info_id, error_id, set_request_id
-        from app.modules.database.shopsync_db import Shelf, Position, StorageAddress
-        request_id = set_request_id()
-
-        cont_id = self._current_id(self.cont_pick)
-        name = (self.shelf_name.text() or "").strip()
-        site_id = self._current_id(self.site_pick)
-
-        if not cont_id:
-            QMessageBox.warning(self, "Select Container", "Pick a Container first.")
-            return
-        if not name:
-            QMessageBox.warning(self, "Missing Data", "Shelf 'Name' is required.")
-            return
-
-        try:
-            with self.db_manager.session_scope() as s:
-                pos = s.query(Position).filter(Position.site_location_id == site_id).first()
-                if not pos:
-                    pos = Position(site_location_id=site_id)
-                    s.add(pos)
-                    s.flush()
-
-                existing = s.query(Shelf).filter(Shelf.container_id == cont_id, Shelf.name == name).first()
-                if existing:
-                    QMessageBox.information(self, "Duplicate", "Shelf already exists.")
-                    return
-
-                obj = Shelf(position_id=pos.id, name=name, container_id=cont_id)
-                s.add(obj)
-                s.flush()
-                StorageAddress.upsert_for_shelf(s, obj, request_id=request_id)
-                info_id(f"[AddLocation] Created Shelf id={obj.id}", request_id=request_id)
-
-            self.shelf_name.clear()
-            self._load_shelves()
-            self._notify_inventory_refresh()
-        except Exception as e:
-            error_id(f"[AddLocation] Failed to create Shelf: {e}", request_id=request_id)
-            QMessageBox.critical(self, "Error", f"Failed to create Shelf:\n{e}")
-
-    def _add_drawer(self):
-        from app.modules.configuration import info_id, error_id, set_request_id
-        from app.modules.database.shopsync_db import Drawer, Position, StorageAddress
-        request_id = set_request_id()
-
-        shelf_id = self._current_id(self.shelf_pick)
-        name = self.drawer_label.text().strip()
-        site_id = self._current_id(self.site_pick)
-
-        if not shelf_id:
-            QMessageBox.warning(self, "Select Shelf", "Pick a Shelf first.")
-            return
-        if not name:
-            QMessageBox.warning(self, "Missing Data", "Please enter a Drawer label.")
-            return
-
-        try:
-            with self.db_manager.session_scope() as s:
-                pos = s.query(Position).filter(Position.site_location_id == site_id).first()
-                if not pos:
-                    pos = Position(site_location_id=site_id)
-                    s.add(pos)
-                    s.flush()
-
-                existing = s.query(Drawer).filter(Drawer.shelf_id == shelf_id, Drawer.name == name).first()
-                if existing:
-                    QMessageBox.information(self, "Duplicate", "Drawer already exists.")
-                    return
-
-                obj = Drawer(position_id=pos.id, name=name, shelf_id=shelf_id)
-                s.add(obj)
-                s.flush()
-                StorageAddress.upsert_for_drawer(s, obj, request_id=request_id)
-                info_id(f"[AddLocation] Created Drawer id={obj.id}", request_id=request_id)
-
-            self.drawer_label.clear()
-            self._load_drawers()
-            self._notify_inventory_refresh()
-        except Exception as e:
-            error_id(f"[AddLocation] Failed to create Drawer: {e}", request_id=request_id)
-            QMessageBox.critical(self, "Error", f"Failed to create Drawer:\n{e}")
-
-    def _add_slot(self):
-        if not self._has_drawer_slot:
-            return
-        from app.modules.configuration import info_id, error_id, set_request_id
-        from app.modules.database.shopsync_db import Drawer, DrawerSlot, StorageAddress
-        request_id = set_request_id()
-
-        drawer_id = self._current_id(self.drawer_pick)
-        label = self.slot_label.text().strip()
-        if not drawer_id:
-            QMessageBox.warning(self, "Select Drawer", "Pick a Drawer first.")
-            return
-        if not label:
-            QMessageBox.warning(self, "Missing Data", "Please enter a Slot label.")
-            return
-
-        try:
-            with self.db_manager.session_scope() as s:
-                drawer = s.get(Drawer, drawer_id)
-                if not drawer:
-                    QMessageBox.critical(self, "Error", f"Drawer {drawer_id} not found.")
-                    return
-
-                existing = s.query(DrawerSlot).filter(DrawerSlot.drawer_id == drawer_id, DrawerSlot.slot_label == label).first()
-                if existing:
-                    QMessageBox.information(self, "Duplicate", "Slot already exists.")
-                    return
-
-                obj = DrawerSlot(drawer_id=drawer_id, slot_label=label)
-                s.add(obj)
-                s.flush()
-                StorageAddress.upsert_for_slot(s, obj, request_id=request_id)
-                info_id(f"[AddLocation] Created Slot id={obj.id}", request_id=request_id)
-
-            self.slot_label.clear()
-            self._load_slots()
-            self._notify_inventory_refresh()
-        except Exception as e:
-            error_id(f"[AddLocation] Failed to create Slot: {e}", request_id=request_id)
-            QMessageBox.critical(self, "Error", f"Failed to create Slot:\n{e}")
 
     # ---------- Helpers ----------
     def _current_id(self, combo: QComboBox):
         idx = combo.currentIndex()
         return combo.itemData(idx) if idx >= 0 else None
 
-    def _clear_site_fields(self):
-        self.site_title.clear()
-        self.site_room.clear()
-        self.site_area.clear()
+    def _on_campus_changed(self, _):
+        self._load_buildings()
+        self._update_buttons_enabled()
+
+    def _on_building_changed(self, _):
+        self._load_sites()
+        self._update_buttons_enabled()
 
     def _on_site_changed(self, _):
         self._load_containers()
@@ -2519,8 +2489,9 @@ class AddLocationWidget(QWidget):
             self._load_slots()
         self._update_buttons_enabled()
 
-    def _on_container_changed(self, idx):
+    def _on_container_changed(self, _):
         self._load_shelves()
+        self._update_buttons_enabled()
 
     def _on_shelf_changed(self, _):
         self._load_drawers()
@@ -2533,17 +2504,69 @@ class AddLocationWidget(QWidget):
             self._load_slots()
         self._update_buttons_enabled()
 
+    def _clear_fields(self):
+        """
+        Clears all fields in AddLocationWidget safely.
+        Prevents crashes if a widget is missing, renamed, or optional.
+        """
+        from app.modules.configuration import info_id, error_id
+
+        try:
+            # --- Reset dropdowns (ComboBoxes) ---
+            dropdowns = [
+                "campus_pick",
+                "building_pick",
+                "site_pick",
+                "area_pick",  # <-- Confirm this matches your Area combo box name
+                "cont_pick",
+                "shelf_pick",
+                "drawer_pick",
+            ]
+
+            # Add slot_pick only if present and drawer/slot hierarchy is enabled
+            if getattr(self, "_has_drawer_slot", False) and hasattr(self, "slot_pick"):
+                dropdowns.append("slot_pick")
+
+            for name in dropdowns:
+                widget = getattr(self, name, None)
+                if widget is not None and hasattr(widget, "setCurrentIndex"):
+                    widget.setCurrentIndex(-1)
+
+            # --- Clear text fields (QLineEdit / QTextEdit) ---
+            text_fields = [
+                "site_title",
+                "site_room",
+                "cont_name",
+                "shelf_name",
+                "drawer_label",
+            ]
+
+            if getattr(self, "_has_drawer_slot", False) and hasattr(self, "slot_label"):
+                text_fields.append("slot_label")
+
+            for name in text_fields:
+                widget = getattr(self, name, None)
+                if widget is not None and hasattr(widget, "clear"):
+                    widget.clear()
+
+            info_id("[AddLocationWidget] Cleared all UI fields successfully")
+
+        except Exception as e:
+            error_id(f"[AddLocationWidget] Error clearing fields: {e}", exc_info=True)
+
     def _update_buttons_enabled(self):
-        site_ok = self._current_id(self.site_pick) is not None or self.site_pick.count() > 0
+        campus_ok = self._current_id(self.campus_pick) is not None
+        building_ok = self._current_id(self.building_pick) is not None
+        site_ok = self._current_id(self.site_pick) is not None
         cont_ok = self._current_id(self.cont_pick) is not None
         shelf_ok = self._current_id(self.shelf_pick) is not None
         drawer_ok = self._current_id(self.drawer_pick) is not None
-
-        self.btn_cont_add.setEnabled(bool(site_ok))
-        self.btn_shelf_add.setEnabled(bool(cont_ok))
-        self.btn_drawer_add.setEnabled(bool(shelf_ok))
+        allow_hierarchy = campus_ok and building_ok and site_ok
+        self.btn_cont_add.setEnabled(allow_hierarchy)
+        self.btn_shelf_add.setEnabled(allow_hierarchy and cont_ok)
+        self.btn_drawer_add.setEnabled(allow_hierarchy and shelf_ok)
         if self._has_drawer_slot:
-            self.btn_slot_add.setEnabled(bool(drawer_ok))
+            self.btn_slot_add.setEnabled(allow_hierarchy and drawer_ok)
 
     def _notify_inventory_refresh(self):
         mw = self.parent()
@@ -2597,6 +2620,159 @@ class AddLocationWidget(QWidget):
         finally:
             self.site_pick.blockSignals(False)
             self._update_buttons_enabled()
+
+    def _add_container(self):
+        from app.modules.configuration import info_id, error_id, set_request_id
+        from app.modules.database.shopsync_db import Container, Position
+        request_id = set_request_id()
+
+        site_id = self._current_id(self.site_pick)
+        campus_id = self._current_id(self.campus_pick)
+        building_id = self._current_id(self.building_pick)
+        area_id = self._current_id(self.area_pick)
+
+        if not (campus_id and building_id and site_id):
+            QMessageBox.warning(self, "Missing Selection", "Select Campus, Building, and Site first.")
+            return
+
+        try:
+            with self.db_manager.session_scope() as s:
+                # --- Ensure Position exists for the selected site ---
+                pos = s.query(Position).filter(Position.site_location_id == site_id).first()
+                if not pos:
+                    pos = Position(site_location_id=site_id)
+                    s.add(pos)
+                    s.flush()
+
+                # --- Link Area if selected ---
+                if area_id:
+                    try:
+                        pos.area_id = area_id
+                    except Exception:
+                        info_id("[AddLocation] Area linking skipped (Position missing area_id column)",
+                                request_id=request_id)
+
+                # --- Create the Container ---
+                container = Container.add_container(
+                    session=s,
+                    position_id=pos.id,
+                    campus_id=campus_id,
+                    building_id=building_id,
+                    site_id=site_id,
+                    description="Auto-created from UI",
+                    request_id=request_id,
+                )
+
+                if not container:
+                    QMessageBox.critical(self, "Error", "Failed to create Container.")
+                    return
+
+                info_id(
+                    f"[AddLocation] Created Container id={container.id} name={container.name} (area_id={area_id})",
+                    request_id=request_id,
+                )
+                self.cont_name.setText(container.name)
+                self._load_containers()
+                self._notify_inventory_refresh()
+
+        except Exception as e:
+            error_id(f"[AddLocation] Failed to create Container: {e}", request_id=request_id)
+            QMessageBox.critical(self, "Error", f"Failed to create Container:\n{e}")
+
+    def _add_shelf(self):
+        from app.modules.configuration import info_id, error_id, set_request_id
+        from app.modules.database.shopsync_db import Shelf, Position
+        request_id = set_request_id()
+
+        cont_id = self._current_id(self.cont_pick)
+        site_id = self._current_id(self.site_pick)
+        if not cont_id:
+            QMessageBox.warning(self, "Select Container", "Pick a Container first.")
+            return
+
+        try:
+            with self.db_manager.session_scope() as s:
+                pos = s.query(Position).filter(Position.site_location_id == site_id).first()
+                if not pos:
+                    pos = Position(site_location_id=site_id)
+                    s.add(pos)
+                    s.flush()
+
+                shelf = Shelf.add_shelf(session=s, container_id=cont_id, position_id=pos.id, request_id=request_id)
+                if not shelf:
+                    QMessageBox.critical(self, "Error", "Failed to create Shelf.")
+                    return
+
+                info_id(f"[AddLocation] Created Shelf id={shelf.id} name={shelf.name}", request_id=request_id)
+                self.shelf_name.setText(shelf.name)
+                self._load_shelves()
+                self._notify_inventory_refresh()
+
+        except Exception as e:
+            error_id(f"[AddLocation] Failed to create Shelf: {e}", request_id=request_id)
+            QMessageBox.critical(self, "Error", f"Failed to create Shelf:\n{e}")
+
+    def _add_drawer(self):
+        from app.modules.configuration import info_id, error_id, set_request_id
+        from app.modules.database.shopsync_db import Drawer, Position
+        request_id = set_request_id()
+
+        shelf_id = self._current_id(self.shelf_pick)
+        site_id = self._current_id(self.site_pick)
+        if not shelf_id:
+            QMessageBox.warning(self, "Select Shelf", "Pick a Shelf first.")
+            return
+
+        try:
+            with self.db_manager.session_scope() as s:
+                pos = s.query(Position).filter(Position.site_location_id == site_id).first()
+                if not pos:
+                    pos = Position(site_location_id=site_id)
+                    s.add(pos)
+                    s.flush()
+
+                drawer = Drawer.add_drawer(session=s, shelf_id=shelf_id, position_id=pos.id, request_id=request_id)
+                if not drawer:
+                    QMessageBox.critical(self, "Error", "Failed to create Drawer.")
+                    return
+
+                info_id(f"[AddLocation] Created Drawer id={drawer.id} name={drawer.name}", request_id=request_id)
+                self.drawer_label.setText(drawer.name)
+                self._load_drawers()
+                self._notify_inventory_refresh()
+
+        except Exception as e:
+            error_id(f"[AddLocation] Failed to create Drawer: {e}", request_id=request_id)
+            QMessageBox.critical(self, "Error", f"Failed to create Drawer:\n{e}")
+
+    def _add_slot(self):
+        if not self._has_drawer_slot:
+            return
+        from app.modules.configuration import info_id, error_id, set_request_id
+        from app.modules.database.shopsync_db import DrawerSlot
+        request_id = set_request_id()
+
+        drawer_id = self._current_id(self.drawer_pick)
+        if not drawer_id:
+            QMessageBox.warning(self, "Select Drawer", "Pick a Drawer first.")
+            return
+
+        try:
+            with self.db_manager.session_scope() as s:
+                slot = DrawerSlot.add_slot(session=s, drawer_id=drawer_id, request_id=request_id)
+                if not slot:
+                    QMessageBox.critical(self, "Error", "Failed to create Slot.")
+                    return
+
+                info_id(f"[AddLocation] Created Slot id={slot.id} label={slot.slot_label}", request_id=request_id)
+                self.slot_label.setText(slot.slot_label)
+                self._load_slots()
+                self._notify_inventory_refresh()
+
+        except Exception as e:
+            error_id(f"[AddLocation] Failed to create Slot: {e}", request_id=request_id)
+            QMessageBox.critical(self, "Error", f"Failed to create Slot:\n{e}")
+
 
 class RemoteInventoryWidget(QWidget):
     """
