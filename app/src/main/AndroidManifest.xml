@@ -5,9 +5,9 @@
     <application
         android:name=".ShopSyncApplication"
         android:allowBackup="true"
-        android:icon="@drawable/ic_shopsync_badge"
+        android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
-        android:roundIcon="@drawable/ic_shopsync_badge"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.ShopSync">
         <activity
