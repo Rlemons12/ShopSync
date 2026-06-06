@@ -57,12 +57,25 @@ The new Android app preserves the repository's working flows while rebuilding th
 - `app/src/main/java/com/shopsync/tablet/ui`: app shell, navigation, components, theme, and screen ViewModels.
 - `app/src/main/AndroidManifest.xml`: Android app manifest.
 
-## Build
+## Setup
 
-Requirements:
+Fresh-clone requirements:
 
-- Android Studio with Android SDK installed
+- Android Studio
 - JDK 17
+- Android SDK Platform 34
+- Android SDK Build-Tools 34.x
+
+Clone the repository and open the project root in Android Studio:
+
+```bash
+git clone <repo-url>
+cd ShopSync_andriod
+```
+
+Android Studio will usually create `local.properties` automatically the first time it opens the project. If it does not, set your SDK path there or configure `ANDROID_HOME` / `ANDROID_SDK_ROOT` locally.
+
+## Build
 
 Build from the repository root:
 
@@ -76,7 +89,26 @@ Windows:
 .\gradlew.bat :app:assembleDebug
 ```
 
-The APK output is generated under `app/build/outputs/apk/debug/`.
+The debug APK is generated at:
+
+```text
+app/build/outputs/apk/debug/app-debug.apk
+```
+
+## Run
+
+In Android Studio:
+
+- Open the project root
+- Let Gradle sync complete
+- Select the `app` run configuration
+- Run on a tablet emulator or physical Android tablet
+
+From the command line, install to a connected device with `adb`:
+
+```powershell
+adb install -r app\build\outputs\apk\debug\app-debug.apk
+```
 
 ## Notes
 
