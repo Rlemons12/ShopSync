@@ -99,16 +99,20 @@ class LocationRepository(
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) {
     fun observeCampuses(): Flow<List<LocationOption>> =
-        database.locationDao().observeCampuses().map { list -> list.map { LocationOption(it.id, it.name) } }
+        database.locationDao().observeCampuses().map { list ->
+            list.map { campus -> LocationOption(campus.id, campus.name) }
+        }
 
     fun observeBuildings(campusId: Long?): Flow<List<LocationOption>> =
-        campusId?.let {
-            database.locationDao().observeBuildings(it).map { list -> list.map { LocationOption(it.id, it.name) } }
+        campusId?.let { id ->
+            database.locationDao().observeBuildings(id).map { list ->
+                list.map { building -> LocationOption(building.id, building.name) }
+            }
         } ?: flow { emit(emptyList()) }
 
     fun observeRoomsForBuilding(buildingId: Long?): Flow<List<LocationOption>> =
-        buildingId?.let {
-            database.locationDao().observeRooms(it).map { list ->
+        buildingId?.let { id ->
+            database.locationDao().observeRooms(id).map { list ->
                 list.map { room ->
                     LocationOption(room.id, "${room.title} (Room ${room.roomNumber}, ${room.siteArea})")
                 }
@@ -123,34 +127,42 @@ class LocationRepository(
         }
 
     fun observeContainers(roomId: Long?): Flow<List<LocationOption>> =
-        roomId?.let {
-            database.locationDao().observeContainers(it).map { list -> list.map { LocationOption(it.id, it.name) } }
+        roomId?.let { id ->
+            database.locationDao().observeContainers(id).map { list ->
+                list.map { container -> LocationOption(container.id, container.name) }
+            }
         } ?: flow { emit(emptyList()) }
 
     fun observeShelves(containerId: Long?): Flow<List<LocationOption>> =
-        containerId?.let {
-            database.locationDao().observeShelves(it).map { list -> list.map { LocationOption(it.id, it.name) } }
+        containerId?.let { id ->
+            database.locationDao().observeShelves(id).map { list ->
+                list.map { shelf -> LocationOption(shelf.id, shelf.name) }
+            }
         } ?: flow { emit(emptyList()) }
 
     fun observeDrawers(shelfId: Long?): Flow<List<LocationOption>> =
-        shelfId?.let {
-            database.locationDao().observeDrawers(it).map { list -> list.map { LocationOption(it.id, it.name) } }
+        shelfId?.let { id ->
+            database.locationDao().observeDrawers(id).map { list ->
+                list.map { drawer -> LocationOption(drawer.id, drawer.name) }
+            }
         } ?: flow { emit(emptyList()) }
 
     fun observeSlots(drawerId: Long?): Flow<List<LocationOption>> =
-        drawerId?.let {
-            database.locationDao().observeSlots(it).map { list -> list.map { LocationOption(it.id, it.label) } }
+        drawerId?.let { id ->
+            database.locationDao().observeSlots(id).map { list ->
+                list.map { slot -> LocationOption(slot.id, slot.label) }
+            }
         } ?: flow { emit(emptyList()) }
 
-    suspend fun addCampus(name: String) = withContext(ioDispatcher) {
+    suspend fun addCampus(name: String): Long = withContext(ioDispatcher) {
         database.locationDao().insertCampus(CampusEntity(name = name.trim()))
     }
 
-    suspend fun addBuilding(campusId: Long, name: String) = withContext(ioDispatcher) {
+    suspend fun addBuilding(campusId: Long, name: String): Long = withContext(ioDispatcher) {
         database.locationDao().insertBuilding(BuildingEntity(campusId = campusId, name = name.trim()))
     }
 
-    suspend fun addRoom(buildingId: Long, title: String, roomNumber: String, siteArea: String) = withContext(ioDispatcher) {
+    suspend fun addRoom(buildingId: Long, title: String, roomNumber: String, siteArea: String): Long = withContext(ioDispatcher) {
         database.locationDao().insertRoom(
             RoomEntity(
                 buildingId = buildingId,
@@ -161,19 +173,19 @@ class LocationRepository(
         )
     }
 
-    suspend fun addContainer(roomId: Long, name: String) = withContext(ioDispatcher) {
+    suspend fun addContainer(roomId: Long, name: String): Long = withContext(ioDispatcher) {
         database.locationDao().insertContainer(ContainerEntity(roomId = roomId, name = name.trim()))
     }
 
-    suspend fun addShelf(containerId: Long, name: String) = withContext(ioDispatcher) {
+    suspend fun addShelf(containerId: Long, name: String): Long = withContext(ioDispatcher) {
         database.locationDao().insertShelf(ShelfEntity(containerId = containerId, name = name.trim()))
     }
 
-    suspend fun addDrawer(shelfId: Long, name: String) = withContext(ioDispatcher) {
+    suspend fun addDrawer(shelfId: Long, name: String): Long = withContext(ioDispatcher) {
         database.locationDao().insertDrawer(DrawerEntity(shelfId = shelfId, name = name.trim()))
     }
 
-    suspend fun addSlot(drawerId: Long, label: String) = withContext(ioDispatcher) {
+    suspend fun addSlot(drawerId: Long, label: String): Long = withContext(ioDispatcher) {
         database.locationDao().insertSlot(SlotEntity(drawerId = drawerId, label = label.trim()))
     }
 }
